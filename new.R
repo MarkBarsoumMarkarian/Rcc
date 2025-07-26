@@ -1,13 +1,18 @@
-library(shiny)
-library(readxl)
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(writexl)
-library(shinyWidgets)
-library(DT)
-library(rmarkdown)
-library(knitr)
+required_packages <- c(
+  "shiny", "readxl", "dplyr", "tidyr", "ggplot2",
+  "writexl", "shinyWidgets", "DT", "rmarkdown",
+  "knitr", "openxlsx"
+)
+
+installed_packages <- rownames(installed.packages())
+for (pkg in required_packages) {
+  if (!(pkg %in% installed_packages)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+}
+
+# Load them all after installing
+lapply(required_packages, library, character.only = TRUE)
 
 ui <- fluidPage(
   titlePanel("ΔΔCt Analysis Tool"),
@@ -16,198 +21,235 @@ ui <- fluidPage(
     sidebarPanel(
       fileInput("normal_file", "Upload Normal Sample Excel", accept = ".xlsx"),
       fileInput("tumor_file", "Upload Tumor Sample Excel", accept = ".xlsx"),
-      pickerInput("ref_genes", "Select Reference Genes", choices = NULL, multiple = TRUE),
+      pickerInput("ref_gene", "Select Reference Gene(s)", choices = NULL, multiple = TRUE),
+      pickerInput("internal_controls", "Select Internal Controls", choices = NULL, multiple = TRUE),
       actionButton("analyze", "Analyze"),
-      downloadButton("download_report", "Download HTML Report")
+      downloadButton("download_results", "Download Results"),
+      downloadButton("download_plot_excel", "Download Internal Controls Plot as Excel"),
+      downloadButton("download_mirna_plots_excel", "Download miRNA Plots as Excel")
     ),
 
     mainPanel(
       tabsetPanel(
-        tabPanel("ΔCt Tables",
-                 h4("Normal Samples"), DTOutput("normal_table"),
-                 h4("Tumor Samples"), DTOutput("tumor_table")),
-        tabPanel("ΔΔCt Table", DTOutput("comparison_table")),
-        tabPanel("Fold Change Plot", plotOutput("fold_change_plot")),
-        tabPanel("ΔΔCt SD Plot", plotOutput("ddct_sd_plot")),
-        tabPanel("ΔCt Plot", plotOutput("dct_plot")),
-        tabPanel("Sample-level Dysregulation", 
-                 DTOutput("sample_ddCt_table"))
+        tabPanel("ΔΔCt Tables",
+                 uiOutput("normal_tables"),
+                 uiOutput("tumor_tables")
+        ),
+        tabPanel("Internal Control Plot", plotOutput("internal_control_plot")),
+        tabPanel("miRNA Ct Plots", uiOutput("mirna_plots"))
       )
     )
   )
 )
 
 server <- function(input, output, session) {
-  dataList <- reactiveValues()
-
-  observeEvent(c(input$normal_file, input$tumor_file), {
+  dataInput <- reactive({
     req(input$normal_file, input$tumor_file)
-    normal <- read_excel(input$normal_file$datapath)
-    tumor <- read_excel(input$tumor_file$datapath)
-
-    required_cols <- c("Target", "Sample", "Cq")
-    if (!all(required_cols %in% names(normal)) || !all(required_cols %in% names(tumor))) {
-      showModal(modalDialog("Each file must contain columns: Target, Sample, Cq", easyClose = TRUE))
-      return()
-    }
-
-    updatePickerInput(session, "ref_genes", choices = unique(normal$Target))
-
-    dataList$normal_raw <- normal
-    dataList$tumor_raw <- tumor
+    normal_df <- read_excel(input$normal_file$datapath)
+    tumor_df <- read_excel(input$tumor_file$datapath)
+    bind_rows(normal_df %>% mutate(Type = "Normal"),
+              tumor_df %>% mutate(Type = "Tumor"))
   })
 
-  observeEvent(input$analyze, {
-    req(input$ref_genes)
+  observeEvent(dataInput(), {
+    gene_choices <- unique(dataInput()$Target)
+    updatePickerInput(session, "ref_gene", choices = gene_choices)
+    updatePickerInput(session, "internal_controls", choices = gene_choices)
+  })
 
-    process_data <- function(df) {
-      df <- df %>%
-        filter(!is.na(Cq)) %>%
-        group_by(Target, Sample) %>%
-        summarise(Cq = mean(Cq), .groups = "drop") %>%
-        pivot_wider(names_from = Target, values_from = Cq)
+  analysis <- eventReactive(input$analyze, {
+    df <- dataInput()
+    req(input$ref_gene)
 
-      ref_mean <- df %>%
-        select(all_of(input$ref_genes)) %>%
-        rowMeans(na.rm = TRUE)
+    df <- df %>%
+      group_by(Sample, Target, Type) %>%
+      summarize(Cq = mean(Cq, na.rm = TRUE), .groups = 'drop') %>%
+      pivot_wider(names_from = Target, values_from = Cq)
 
-      df$Ct_ref <- ref_mean
-      targets <- setdiff(names(df), c("Sample", input$ref_genes, "Ct_ref"))
+    df$Ct_ref <- rowMeans(df[, input$ref_gene], na.rm = TRUE)
 
-      for (target in targets) {
-        df[[paste0("dCt_", target)]] <- df[[target]] - df$Ct_ref
-      }
-      df
+    targets <- setdiff(names(df), c("Sample", "Type", input$ref_gene, "Ct_ref"))
+
+    for (target in targets) {
+      df[[paste0("dCt_", target)]] <- df[[target]] - df$Ct_ref
     }
 
-    normal_dCt <- process_data(dataList$normal_raw)
-    tumor_dCt <- process_data(dataList$tumor_raw)
+    normal_df <- df %>% filter(Type == "Normal")
+    tumor_df <- df %>% filter(Type == "Tumor")
 
+    means_normal <- sapply(targets, function(t) mean(normal_df[[paste0("dCt_", t)]], na.rm = TRUE))
 
+    for (target in targets) {
+      normal_df[[paste0("ddCt_", target)]] <- normal_df[[paste0("dCt_", target)]] - means_normal[[target]]
+      normal_df[[paste0("FC_", target)]] <- 2^(-normal_df[[paste0("ddCt_", target)]])
 
-    comparison <- data.frame(Target = setdiff(names(normal_dCt), c("Sample", input$ref_genes, "Ct_ref")))
-    comparison$Target <- gsub("dCt_", "", comparison$Target)
+      tumor_df[[paste0("ddCt_", target)]] <- tumor_df[[paste0("dCt_", target)]] - means_normal[[target]]
+      tumor_df[[paste0("FC_", target)]] <- 2^(-tumor_df[[paste0("ddCt_", target)]])
+    }
 
-    comparison <- comparison %>%
-      rowwise() %>%
-      mutate(
-        mean_dCt_normal = mean(normal_dCt[[paste0("dCt_", Target)]], na.rm = TRUE),
-        mean_dCt_tumor = mean(tumor_dCt[[paste0("dCt_", Target)]], na.rm = TRUE),
-        ddCt = mean_dCt_tumor - mean_dCt_normal,
-        ddCt_sd = sd(tumor_dCt[[paste0("dCt_", Target)]] - normal_dCt[[paste0("dCt_", Target)]], na.rm = TRUE),
-        fold_change = 2^(-ddCt),
-        regulation = case_when(
-          fold_change > 1.5 ~ "Upregulated",
-          fold_change < 0.66 ~ "Downregulated",
-          TRUE ~ "No Change"
-        )
-      ) %>%
-      ungroup()
+    list(normal = normal_df, tumor = tumor_df, targets = targets)
+  })
 
-    normal_dCt_long <- normal_dCt %>%
-      select(Sample, starts_with("dCt_")) %>%
-      pivot_longer(-Sample, names_to = "Target", values_to = "dCt") %>%
-      mutate(Target = gsub("dCt_", "", Target), Group = "Normal")
+  output$normal_tables <- renderUI({
+    req(analysis())
+    targets <- analysis()$targets
+    normal_df <- analysis()$normal
+    tables <- lapply(targets, function(target) {
+      datatable(normal_df[, c("Sample", input$ref_gene, target,
+                              paste0("dCt_", target),
+                              paste0("ddCt_", target),
+                              paste0("FC_", target))],
+                options = list(scrollX = TRUE),
+                caption = htmltools::tags$caption(
+                  style = 'caption-side: top; text-align: left;',
+                  paste("Normal Tissue -", target)))
+    })
+    do.call(tagList, tables)
+  })
 
-    tumor_dCt_long <- tumor_dCt %>%
-      select(Sample, starts_with("dCt_")) %>%
-      pivot_longer(-Sample, names_to = "Target", values_to = "dCt") %>%
-      mutate(Target = gsub("dCt_", "", Target), Group = "Tumor")
+  output$tumor_tables <- renderUI({
+    req(analysis())
+    targets <- analysis()$targets
+    tumor_df <- analysis()$tumor
+    tables <- lapply(targets, function(target) {
+      datatable(tumor_df[, c("Sample", input$ref_gene, target,
+                            paste0("dCt_", target),
+                            paste0("ddCt_", target),
+                            paste0("FC_", target))],
+                options = list(scrollX = TRUE),
+                caption = htmltools::tags$caption(
+                  style = 'caption-side: top; text-align: left;',
+                  paste("Tumor Tissue -", target)))
+    })
+    do.call(tagList, tables)
+  })
 
-baseline_normal <- normal_dCt %>%
-  select(starts_with("dCt_")) %>%
-  summarise(across(everything(), mean, na.rm = TRUE)) %>%
-  pivot_longer(everything(), names_to = "Target", values_to = "baseline_dCt") %>%
-  mutate(Target = gsub("dCt_", "", Target))
+  output$internal_control_plot <- renderPlot({
+    req(dataInput(), input$internal_controls)
+    df <- dataInput()
+    internal_controls <- df %>% filter(Target %in% input$internal_controls)
 
-all_samples <- bind_rows(
-  normal_dCt %>% mutate(Group = "Normal"),
-  tumor_dCt %>% mutate(Group = "Tumor")
-)
+    ggplot(internal_controls, aes(x = Sample, y = Cq, fill = Target)) +
+      geom_bar(stat = "identity", position = position_dodge()) +
+      theme_minimal() +
+      labs(title = "Ct of Internal Controls across Samples",
+           x = "Sample",
+           y = "Ct Value") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
 
-all_samples_long <- all_samples %>%
-  select(Sample, Group, starts_with("dCt_")) %>%
-  pivot_longer(cols = starts_with("dCt_"), names_to = "Target", values_to = "dCt") %>%
-  mutate(Target = gsub("dCt_", "", Target))
+  output$mirna_plots <- renderUI({
+    req(dataInput())
+    df <- dataInput()
+    mirna_targets <- setdiff(unique(df$Target), input$internal_controls)
 
-sample_ddCt <- all_samples_long %>%
-  left_join(baseline_normal, by = "Target") %>%
-  mutate(
-    ddCt_sample = dCt - baseline_dCt,
-    fold_change_sample = 2^(-ddCt_sample),
-    regulation_sample = case_when(
-      fold_change_sample > 1.5 ~ "Upregulated",
-      fold_change_sample < 0.66 ~ "Downregulated",
-      TRUE ~ "No Change"
-    )
+    plots <- lapply(mirna_targets, function(target) {
+      plot_data <- df %>% filter(Target == target)
+
+      plot_output <- renderPlot({
+        ggplot(plot_data, aes(x = Sample, y = Cq, fill = Type)) +
+          geom_bar(stat = "identity", position = position_dodge()) +
+          theme_minimal() +
+          labs(title = paste("Ct Values for", target), x = "Sample", y = "Ct") +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      })
+
+      plotOutput(outputId = paste0("mirna_plot_", target))
+    })
+    do.call(tagList, plots)
+  })
+
+  observe({
+    req(dataInput())
+    df <- dataInput()
+    mirna_targets <- setdiff(unique(df$Target), input$internal_controls)
+
+    for (target in mirna_targets) {
+      local({
+        local_target <- target
+        output[[paste0("mirna_plot_", local_target)]] <- renderPlot({
+          plot_data <- df %>% filter(Target == local_target)
+          ggplot(plot_data, aes(x = Sample, y = Cq, fill = Type)) +
+            geom_bar(stat = "identity", position = position_dodge()) +
+            theme_minimal() +
+            labs(title = paste("Ct Values for", local_target), x = "Sample", y = "Ct") +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        })
+      })
+    }
+  })
+
+  output$download_results <- downloadHandler(
+    filename = function() {
+      paste0("ddct_results_", Sys.Date(), ".xlsx")
+    },
+    content = function(file) {
+      result <- analysis()
+      wb <- createWorkbook()
+      addWorksheet(wb, "Normal")
+      writeData(wb, "Normal", result$normal)
+      addWorksheet(wb, "Tumor")
+      writeData(wb, "Tumor", result$tumor)
+      saveWorkbook(wb, file)
+    }
   )
 
-# Save all data to reactiveValues
-dataList$normal <- normal_dCt
-dataList$tumor <- tumor_dCt
-dataList$comparison <- comparison
-dataList$plot_data <- bind_rows(normal_dCt_long, tumor_dCt_long)
-dataList$sample_ddCt <- sample_ddCt
-  })
-
-output$sample_ddCt_table <- renderDT({
-  req(dataList$sample_ddCt)
-  datatable(dataList$sample_ddCt, filter = "top",
-            options = list(pageLength = 15, scrollX = TRUE))
-})
-
-  output$normal_table <- renderDT({
-    req(dataList$normal)
-    datatable(dataList$normal)
-  })
-
-  output$tumor_table <- renderDT({
-    req(dataList$tumor)
-    datatable(dataList$tumor)
-  })
-
-  output$comparison_table <- renderDT({
-    req(dataList$comparison)
-    datatable(dataList$comparison)
-  })
-
-  output$fold_change_plot <- renderPlot({
-    req(dataList$comparison)
-    ggplot(dataList$comparison, aes(x = reorder(Target, fold_change), y = fold_change, fill = regulation)) +
-      geom_col() +
-      coord_flip() +
-      geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
-      labs(title = "Fold Change (Tumor vs Normal)", y = "Fold Change (2^-ΔΔCt)", x = "miRNA") +
-      theme_minimal() +
-      scale_fill_manual(values = c("Upregulated" = "#E74C3C", "Downregulated" = "#3498DB", "No Change" = "gray"))
-  })
-
-  output$ddct_sd_plot <- renderPlot({
-    req(dataList$comparison)
-    ggplot(dataList$comparison, aes(x = reorder(Target, ddCt_sd), y = ddCt_sd)) +
-      geom_col(fill = "purple") +
-      coord_flip() +
-      labs(title = "ΔΔCt Standard Deviation", y = "SD of ΔΔCt", x = "miRNA") +
-      theme_minimal()
-  })
-
-  output$dct_plot <- renderPlot({
-    req(dataList$plot_data)
-    ggplot(dataList$plot_data, aes(x = Target, y = dCt, fill = Group)) +
-      geom_boxplot() +
-      labs(title = "ΔCt Comparison Between Groups", x = "miRNA", y = "ΔCt") +
-      theme_minimal()
-  })
-
-  output$download_report <- downloadHandler(
-    filename = function() { "ddct_report.html" },
+  output$download_plot_excel <- downloadHandler(
+    filename = function() {
+      paste0("Internal_Controls_Plot_", Sys.Date(), ".xlsx")
+    },
     content = function(file) {
-      tempReport <- tempfile(fileext = ".Rmd")
-      reportContent <- "---\ntitle: 'ΔΔCt Expression Report'\noutput: html_document\n---\n\n```{r setup, include=FALSE}\nlibrary(dplyr)\nlibrary(ggplot2)\nnormal <- dataList$normal\ntumor <- dataList$tumor\ncomparison <- dataList$comparison\nplot_data <- dataList$plot_data\n```\n\n# ΔCt Tables\n\n## Normal Samples\n```{r}\nknitr::kable(normal)\n```\n\n## Tumor Samples\n```{r}\nknitr::kable(tumor)\n```\n\n# Comparison Table\n```{r}\nknitr::kable(comparison)\n```\n\n# Fold Change Plot\n```{r}\nggplot(comparison, aes(x = reorder(Target, fold_change), y = fold_change, fill = regulation)) +\n  geom_col() +\n  coord_flip() +\n  geom_hline(yintercept = 1, linetype = 'dashed', color = 'gray40') +\n  labs(title = 'Fold Change (Tumor vs Normal)', y = 'Fold Change (2^-ΔΔCt)', x = 'miRNA') +\n  theme_minimal() +\n  scale_fill_manual(values = c('Upregulated' = '#E74C3C', 'Downregulated' = '#3498DB', 'No Change' = 'gray'))\n```\n\n# ΔΔCt SD Plot\n```{r}\nggplot(comparison, aes(x = reorder(Target, ddCt_sd), y = ddCt_sd)) +\n  geom_col(fill = 'purple') +\n  coord_flip() +\n  labs(title = 'ΔΔCt Standard Deviation', y = 'SD of ΔΔCt', x = 'miRNA') +\n  theme_minimal()\n```\n\n# ΔCt Plot\n```{r}\nggplot(plot_data, aes(x = Target, y = dCt, fill = Group)) +\n  geom_boxplot() +\n  labs(title = 'ΔCt Comparison Between Groups', x = 'miRNA', y = 'ΔCt') +\n  theme_minimal()\n```"
-      writeLines(reportContent, tempReport)
-      rmarkdown::render(tempReport, output_file = file, envir = new.env(parent = globalenv()))
+      req(dataInput(), input$internal_controls)
+      df <- dataInput()
+      internal_controls <- df %>% filter(Target %in% input$internal_controls)
+
+      p <- ggplot(internal_controls, aes(x = Sample, y = Cq, fill = Target)) +
+        geom_bar(stat = "identity", position = position_dodge()) +
+        theme_minimal() +
+        labs(title = "Ct of Internal Controls across Samples",
+             x = "Sample",
+             y = "Ct Value") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+      tmpfile <- tempfile(fileext = ".png")
+      ggsave(tmpfile, plot = p, width = 8, height = 5)
+
+      wb <- createWorkbook()
+      addWorksheet(wb, "Internal Controls Plot")
+      insertImage(wb, sheet = 1, tmpfile, startRow = 1, startCol = 1, width = 15, height = 6)
+      saveWorkbook(wb, file)
+    }
+  )
+
+  output$download_mirna_plots_excel <- downloadHandler(
+    filename = function() {
+      paste0("miRNA_Ct_Plots_", Sys.Date(), ".xlsx")
+    },
+    content = function(file) {
+      df <- dataInput()
+      mirna_targets <- setdiff(unique(df$Target), input$internal_controls)
+
+      wb <- createWorkbook()
+
+      for (target in mirna_targets) {
+        plot_data <- df %>% filter(Target == target)
+
+        p <- ggplot(plot_data, aes(x = Sample, y = Cq, fill = Type)) +
+          geom_bar(stat = "identity", position = position_dodge()) +
+          theme_minimal() +
+          labs(title = paste("Ct Values for", target), x = "Sample", y = "Ct") +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+        tmpfile <- tempfile(fileext = ".png")
+        ggsave(tmpfile, plot = p, width = 8, height = 5)
+
+        addWorksheet(wb, target)
+        insertImage(wb, sheet = target, file = tmpfile, startRow = 1, startCol = 1, width = 15, height = 6)
+      }
+
+      saveWorkbook(wb, file)
     }
   )
 }
 
-shinyApp(ui = ui, server = server)
+shinyApp(ui, server)
