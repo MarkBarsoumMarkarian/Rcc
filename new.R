@@ -1,255 +1,543 @@
+# -------------------- Required packages ------------------------------------------------
 required_packages <- c(
   "shiny", "readxl", "dplyr", "tidyr", "ggplot2",
-  "writexl", "shinyWidgets", "DT", "rmarkdown",
-  "knitr", "openxlsx"
+  "writexl", "shinyWidgets", "DT", "openxlsx", "plotly",
+  "shinycssloaders", "glue"
 )
 
 installed_packages <- rownames(installed.packages())
 for (pkg in required_packages) {
   if (!(pkg %in% installed_packages)) {
-    install.packages(pkg, dependencies = TRUE)
+    install.packages(pkg, dependencies = TRUE, quiet = TRUE)
   }
 }
 
-# Load them all after installing
 lapply(required_packages, library, character.only = TRUE)
 
+# -------------------- Helper functions -------------------------------------------------
+read_and_validate <- function(file, tag = NULL) {
+  req(file)
+  df <- tryCatch(read_excel(file$datapath), error = function(e) NULL)
+  if (is.null(df)) stop(glue::glue("Failed to read {tag %||% 'file'} — not a valid Excel file."))
+  colnames(df) <- trimws(colnames(df))
+  required_cols <- c("Sample", "Target", "Cq")
+  if (!all(required_cols %in% colnames(df))) {
+    stop(glue::glue("Uploaded file must contain columns: {paste(required_cols, collapse=', ')}."))
+  }
+  df
+}
+
+merge_inputs <- function(normal_file, tumor_file = NULL) {
+  normal_df <- read_and_validate(normal_file, "Normal file")
+  if (is.null(tumor_file)) {
+    if (!("Type" %in% colnames(normal_df))) {
+      stop("Single file provided but missing 'Type' column. Either upload two files or include Type column with values 'Normal'/'Tumor'.")
+    }
+    normal_df$Type <- ifelse(tolower(normal_df$Type) %in% c("normal","control"), "Normal",
+                             ifelse(tolower(normal_df$Type) %in% c("tumor","cancer"), "Tumor", normal_df$Type))
+    return(normal_df)
+  }
+  tumor_df <- read_and_validate(tumor_file, "Tumor file")
+  if (!("Type" %in% colnames(normal_df))) normal_df$Type <- "Normal"
+  if (!("Type" %in% colnames(tumor_df))) tumor_df$Type <- "Tumor"
+  bind_rows(normal_df, tumor_df)
+}
+
+# sanitize output IDs so special characters in miRNA names don't break Shiny
+sanitize_id <- function(x) {
+  x <- as.character(x)
+  x <- gsub("[^A-Za-z0-9_]", "_", x)
+  x <- gsub("__+", "_", x)
+  x <- sub("^_+", "", x)
+  x <- substr(x, 1, 60)
+  x
+}
+
+# make a vector of unique safe ids from targets (append suffix if needed)
+unique_safe_ids <- function(targets) {
+  safe <- sapply(targets, sanitize_id)
+  dupes <- which(duplicated(safe) | duplicated(safe, fromLast = TRUE))
+  if (length(dupes) > 0) {
+    counts <- table(safe)
+    for (nm in names(counts[counts > 1])) {
+      idx <- which(safe == nm)
+      for (i in seq_along(idx)) safe[idx[i]] <- paste0(nm, "_", i)
+    }
+  }
+  safe
+}
+
+# Given an info object (from calc_ddct_per_miRNA), build a combined table matching the Excel layout:
+# Left block = Normal samples (Sample, Cq, dCt, FC), Middle block = Tumor samples (Sample, Cq, dCt, ddCt, FC),
+# Right block = Summary (Group, Fold Change, SEM, Significance).
+build_excel_like_table <- function(info) {
+  raw <- info$raw
+  normal <- raw %>% filter(Type == "Normal") %>% arrange(Sample) %>% select(Sample, Cq, dCt, ddCt, FC)
+  tumor  <- raw %>% filter(Type == "Tumor")  %>% arrange(Sample) %>% select(Sample, Cq, dCt, ddCt, FC)
+
+  # pad so both have same number of rows
+  nmax <- max(nrow(normal), nrow(tumor), 1)
+  pad_rows <- function(df, n) {
+    if (nrow(df) < n) {
+      # create extra rows with same columns
+      extra <- data.frame(matrix(NA, n - nrow(df), ncol(df)))
+      colnames(extra) <- colnames(df)
+      df <- bind_rows(df, extra)
+    }
+    df
+  }
+  normal_p <- pad_rows(normal, nmax)
+  tumor_p  <- pad_rows(tumor, nmax)
+
+  # rename columns to indicate block
+  colnames(normal_p) <- paste0("Normal_", c("Sample","Cq","dCt","ddCt","FC"))
+  colnames(tumor_p)  <- paste0("Tumor_",  c("Sample","Cq","dCt","ddCt","FC"))
+
+  # summary: compute group-level Fold Change, SEM, Significance (NA by default)
+  summarize_group <- function(dfgroup) {
+    if (nrow(dfgroup) == 0) return(data.frame(FoldChange = NA_real_, SEM = NA_real_, Significance = NA_real_))
+    fc_vec <- dfgroup$FC
+    fc_vec <- fc_vec[!is.na(fc_vec)]
+    if (length(fc_vec) == 0) return(data.frame(FoldChange = NA_real_, SEM = NA_real_, Significance = NA_real_))
+    mean_fc <- mean(fc_vec)
+    sem_fc  <- ifelse(length(fc_vec) > 1, sd(fc_vec)/sqrt(length(fc_vec)), 0)
+    data.frame(FoldChange = mean_fc, SEM = sem_fc, Significance = NA_real_)
+  }
+
+  normal_sum <- summarize_group(normal %>% filter(!is.na(FC)))
+  tumor_sum  <- summarize_group(tumor %>% filter(!is.na(FC)))
+
+  # Build a summary block with nmax rows, first row = Normal summary, second = Tumor summary, others NA
+  summary_block <- data.frame(
+    Group = rep(NA_character_, nmax),
+    FoldChange = rep(NA_real_, nmax),
+    SEM = rep(NA_real_, nmax),
+    Significance = rep(NA_real_, nmax),
+    stringsAsFactors = FALSE
+  )
+  if (nmax >= 1) {
+    summary_block$Group[1] <- "Normal"
+    summary_block$FoldChange[1] <- normal_sum$FoldChange
+    summary_block$SEM[1] <- normal_sum$SEM
+    summary_block$Significance[1] <- normal_sum$Significance
+  }
+  if (nmax >= 2) {
+    summary_block$Group[2] <- "Tumor"
+    summary_block$FoldChange[2] <- tumor_sum$FoldChange
+    summary_block$SEM[2] <- tumor_sum$SEM
+    summary_block$Significance[2] <- tumor_sum$Significance
+  }
+
+  combined <- bind_cols(normal_p, tumor_p, summary_block)
+
+  # Round numeric columns for display like your Excel
+  num_cols <- sapply(combined, is.numeric)
+  combined[num_cols] <- lapply(combined[num_cols], function(x) ifelse(is.na(x), NA, round(x, 4)))
+
+  combined
+}
+
+calc_ddct_per_miRNA <- function(df, ref_genes) {
+  req(df)
+  if (length(ref_genes) < 1) stop("At least one reference gene must be selected.")
+  if (!all(ref_genes %in% df$Target)) stop("Some selected reference genes are not present in the data.")
+
+  # aggregate technical replicates
+  df_agg <- df %>% group_by(Sample, Target, Type) %>% summarise(Cq = mean(Cq, na.rm = TRUE), .groups = 'drop')
+  df_wide <- df_agg %>% pivot_wider(names_from = Target, values_from = Cq)
+
+  ref_present <- intersect(ref_genes, colnames(df_wide))
+  if (length(ref_present) == 0) stop("None of the selected reference genes are present in the dataset.")
+
+  df_wide <- df_wide %>% mutate(Ct_ref = rowMeans(select(., all_of(ref_present)), na.rm = TRUE))
+
+  meta_cols <- c("Sample", "Type", ref_present, "Ct_ref")
+  targets <- setdiff(colnames(df_wide), meta_cols)
+  targets <- targets[!is.na(targets) & targets != ""]
+
+  if (length(targets) == 0) stop("No miRNA targets found in the dataset after processing.")
+
+  # compute dCt columns
+  for (t in targets) {
+    df_wide[[paste0("dCt_", t)]] <- df_wide[[t]] - df_wide$Ct_ref
+  }
+
+  # mean dCt across Normal samples
+  normal_rows <- df_wide %>% filter(Type == "Normal")
+  normal_mean_dCt <- list()
+  for (t in targets) normal_mean_dCt[[t]] <- mean(normal_rows[[paste0("dCt_", t)]], na.rm = TRUE)
+
+  # create unique safe IDs for targets
+  safe_map <- unique_safe_ids(targets)
+
+  per_miRNA <- list()
+  for (i in seq_along(targets)) {
+    t <- targets[i]
+    safe <- safe_map[i]
+    dct_col <- paste0("dCt_", t)
+    tbl <- df_wide %>% select(Sample, Type, all_of(t), all_of(dct_col)) %>%
+      rename(Cq = all_of(t), dCt = all_of(dct_col)) %>%
+      mutate(ddCt = dCt - normal_mean_dCt[[t]], FC = 2^(-ddCt))
+
+    # summaries for Normal and Tumor groups
+    normal_tbl <- tbl %>% filter(Type == "Normal")
+    tumor_tbl  <- tbl %>% filter(Type == "Tumor")
+
+    summarize_group <- function(dfgroup) {
+      if (nrow(dfgroup) == 0) return(data.frame(n = 0, mean_Cq = NA_real_, mean_dCt = NA_real_, var_dCt = NA_real_, sd_dCt = NA_real_, mean_ddCt = NA_real_, mean_FC = NA_real_))
+      data.frame(
+        n = nrow(dfgroup),
+        mean_Cq = mean(dfgroup$Cq, na.rm = TRUE),
+        mean_dCt = mean(dfgroup$dCt, na.rm = TRUE),
+        var_dCt = var(dfgroup$dCt, na.rm = TRUE),
+        sd_dCt = sd(dfgroup$dCt, na.rm = TRUE),
+        mean_ddCt = mean(dfgroup$ddCt, na.rm = TRUE),
+        mean_FC = mean(dfgroup$FC, na.rm = TRUE)
+      )
+    }
+
+    normal_summary <- summarize_group(normal_tbl)
+    tumor_summary  <- summarize_group(tumor_tbl)
+
+    direction <- NA_character_
+    if (!is.na(normal_summary$mean_FC) && !is.na(tumor_summary$mean_FC)) {
+      if (tumor_summary$mean_FC > normal_summary$mean_FC) direction <- "Upregulated in Tumor"
+      else if (tumor_summary$mean_FC < normal_summary$mean_FC) direction <- "Downregulated in Tumor"
+      else direction <- "No change"
+    }
+
+    # Build combined table to replicate your Excel layout
+    combined_table <- tryCatch(build_excel_like_table(list(raw = tbl)), error = function(e) {
+      # fallback: create a minimal table
+      warning(sprintf("Failed to build excel-like table for %s: %s", t, e$message))
+      return(data.frame(Note = "Failed to format table"))
+    })
+
+    # ensure direction is plain character and excel_like is a data.frame
+    direction <- as.character(direction)
+    excel_like_df <- tryCatch({
+      if (is.data.frame(combined_table)) combined_table else as.data.frame(combined_table)
+    }, error = function(e) {
+      warning(sprintf("Could not coerce excel_like table for %s: %s", t, e$message))
+      data.frame(Note = "Failed to format table")
+    })
+
+    per_miRNA[[t]] <- list(
+      raw = tbl,
+      normal_summary = normal_summary,
+      tumor_summary  = tumor_summary,
+      direction = direction,
+      safe_id = safe,
+      excel_like = excel_like_df
+    )
+  }
+
+  list(wide = df_wide, per_miRNA = per_miRNA, targets = targets)
+}
+
+plot_miRNA <- function(tbl, target_name) {
+  ggplot(tbl, aes(x = Sample, y = Cq, fill = Type)) +
+    geom_col(position = position_dodge()) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste0("Ct values — ", target_name), y = "Cq", x = "Sample")
+}
+
+# -------------------- UI ----------------------------------------------------------------
 ui <- fluidPage(
-  titlePanel("ΔΔCt Analysis Tool"),
+  tags$head(tags$style(HTML('.muted {color:#777;font-size:12px} .big-title {font-weight:700;font-size:20px} .small {font-size:11px;color:#666}'))),
+  titlePanel(div(class = "big-title", "ΔΔCt Analysis Tool — Excel-like Analysis Layout ✨")),
 
   sidebarLayout(
-    sidebarPanel(
-      fileInput("normal_file", "Upload Normal Sample Excel", accept = ".xlsx"),
-      fileInput("tumor_file", "Upload Tumor Sample Excel", accept = ".xlsx"),
-      pickerInput("ref_gene", "Select Reference Gene(s)", choices = NULL, multiple = TRUE),
-      pickerInput("internal_controls", "Select Internal Controls", choices = NULL, multiple = TRUE),
-      actionButton("analyze", "Analyze"),
-      downloadButton("download_results", "Download Results"),
-      downloadButton("download_plot_excel", "Download Internal Controls Plot as Excel"),
-      downloadButton("download_mirna_plots_excel", "Download miRNA Plots as Excel")
-    ),
+    sidebarPanel(width = 3,
+                 h4("Upload & Options"),
+                 helpText("Upload either: (A) two files (Normal & Tumor) OR (B) single file with Type column."),
+                 fileInput("normal_file", "Normal (or combined) - Excel", accept = c(".xlsx")),
+                 fileInput("tumor_file", "Tumor - Excel (optional)", accept = c(".xlsx")),
+                 hr(),
+                 pickerInput("ref_gene", "Reference gene(s)", choices = NULL, multiple = TRUE, options = list(`live-search` = TRUE)),
+                 pickerInput("internal_controls", "Internal control(s) (for QC plots)", choices = NULL, multiple = TRUE, options = list(`live-search` = TRUE)),
+                 actionButton("analyze", "Analyze", class = "btn-primary", width = "100%"),
+                 br(), br(),
+                 tags$div(class = "muted", "Analyze will be enabled when files + at least one reference gene are present."),
+                 hr(),
+                 downloadButton("download_results", "Download Results (xlsx)"),
+                 br(), br(),
+                 downloadButton("download_plots_zip", "Download Plots (zip)"),
+                 br(), br(),
+                 downloadButton("download_plots_excel", "Download Plots (xlsx)")) ,
 
-    mainPanel(
-      tabsetPanel(
-        tabPanel("ΔΔCt Tables",
-                 uiOutput("normal_tables"),
-                 uiOutput("tumor_tables")
-        ),
-        tabPanel("Internal Control Plot", plotOutput("internal_control_plot")),
-        tabPanel("miRNA Ct Plots", uiOutput("mirna_plots"))
-      )
+    mainPanel(width = 9,
+              tabsetPanel(
+                tabPanel("Preview",
+                         fluidRow(
+                           column(6, h5("File 1 Preview"), DTOutput("preview_1") %>% shinycssloaders::withSpinner()),
+                           column(6, h5("File 2 Preview"), DTOutput("preview_2") %>% shinycssloaders::withSpinner())
+                         )
+                ),
+                tabPanel("Analysis",
+                         verbatimTextOutput("analysis_info"),
+                         hr(),
+                         h4("Per-miRNA Results"),
+                         uiOutput("miRNA_tables_ui")
+                ),
+                tabPanel("Plots",
+                         h5("Internal Controls"), plotlyOutput("internal_controls_plot") %>% shinycssloaders::withSpinner(),
+                         hr(),
+                         h5("miRNA Plots"), uiOutput("miRNA_plots_ui")
+                ),
+                tabPanel("Help",
+                         p("Expected columns in each upload: Sample, Target, Cq. Optional: Type (Normal/Tumor)."),
+                         p("Per-miRNA results include: dCt (per sample), ddCt (relative to mean Normal dCt), variance, sd, fold change (2^-ddCt), and simple direction call.")
+                )
+              )
     )
   )
 )
 
+# -------------------- Server ------------------------------------------------------------
 server <- function(input, output, session) {
-  dataInput <- reactive({
-    req(input$normal_file, input$tumor_file)
-    normal_df <- read_excel(input$normal_file$datapath)
-    tumor_df <- read_excel(input$tumor_file$datapath)
-    bind_rows(normal_df %>% mutate(Type = "Normal"),
-              tumor_df %>% mutate(Type = "Tumor"))
-  })
 
-  observeEvent(dataInput(), {
-    gene_choices <- unique(dataInput()$Target)
-    updatePickerInput(session, "ref_gene", choices = gene_choices)
-    updatePickerInput(session, "internal_controls", choices = gene_choices)
-  })
+  # Reactive reads for previews (no validation yet)
+  raw1 <- reactive({ req(input$normal_file); tryCatch(read_excel(input$normal_file$datapath), error = function(e) NULL) })
+  raw2 <- reactive({ if (is.null(input$tumor_file)) return(NULL); tryCatch(read_excel(input$tumor_file$datapath), error = function(e) NULL) })
 
-  analysis <- eventReactive(input$analyze, {
-    df <- dataInput()
-    req(input$ref_gene)
+  output$preview_1 <- renderDT({ req(raw1()); DT::datatable(head(as.data.frame(raw1()), 200), options = list(scrollX = TRUE)) })
+  output$preview_2 <- renderDT({ if (is.null(raw2())) datatable(data.frame(Note = "No file"), options = list(dom = 't')) else datatable(head(as.data.frame(raw2()), 200), options = list(scrollX = TRUE)) })
 
-    df <- df %>%
-      group_by(Sample, Target, Type) %>%
-      summarize(Cq = mean(Cq, na.rm = TRUE), .groups = 'drop') %>%
-      pivot_wider(names_from = Target, values_from = Cq)
-
-    df$Ct_ref <- rowMeans(df[, input$ref_gene], na.rm = TRUE)
-
-    targets <- setdiff(names(df), c("Sample", "Type", input$ref_gene, "Ct_ref"))
-
-    for (target in targets) {
-      df[[paste0("dCt_", target)]] <- df[[target]] - df$Ct_ref
-    }
-
-    normal_df <- df %>% filter(Type == "Normal")
-    tumor_df <- df %>% filter(Type == "Tumor")
-
-    means_normal <- sapply(targets, function(t) mean(normal_df[[paste0("dCt_", t)]], na.rm = TRUE))
-
-    for (target in targets) {
-      normal_df[[paste0("ddCt_", target)]] <- normal_df[[paste0("dCt_", target)]] - means_normal[[target]]
-      normal_df[[paste0("FC_", target)]] <- 2^(-normal_df[[paste0("ddCt_", target)]])
-
-      tumor_df[[paste0("ddCt_", target)]] <- tumor_df[[paste0("dCt_", target)]] - means_normal[[target]]
-      tumor_df[[paste0("FC_", target)]] <- 2^(-tumor_df[[paste0("ddCt_", target)]])
-    }
-
-    list(normal = normal_df, tumor = tumor_df, targets = targets)
-  })
-
-  output$normal_tables <- renderUI({
-    req(analysis())
-    targets <- analysis()$targets
-    normal_df <- analysis()$normal
-    tables <- lapply(targets, function(target) {
-      datatable(normal_df[, c("Sample", input$ref_gene, target,
-                              paste0("dCt_", target),
-                              paste0("ddCt_", target),
-                              paste0("FC_", target))],
-                options = list(scrollX = TRUE),
-                caption = htmltools::tags$caption(
-                  style = 'caption-side: top; text-align: left;',
-                  paste("Normal Tissue -", target)))
-    })
-    do.call(tagList, tables)
-  })
-
-  output$tumor_tables <- renderUI({
-    req(analysis())
-    targets <- analysis()$targets
-    tumor_df <- analysis()$tumor
-    tables <- lapply(targets, function(target) {
-      datatable(tumor_df[, c("Sample", input$ref_gene, target,
-                            paste0("dCt_", target),
-                            paste0("ddCt_", target),
-                            paste0("FC_", target))],
-                options = list(scrollX = TRUE),
-                caption = htmltools::tags$caption(
-                  style = 'caption-side: top; text-align: left;',
-                  paste("Tumor Tissue -", target)))
-    })
-    do.call(tagList, tables)
-  })
-
-  output$internal_control_plot <- renderPlot({
-    req(dataInput(), input$internal_controls)
-    df <- dataInput()
-    internal_controls <- df %>% filter(Target %in% input$internal_controls)
-
-    ggplot(internal_controls, aes(x = Sample, y = Cq, fill = Target)) +
-      geom_bar(stat = "identity", position = position_dodge()) +
-      theme_minimal() +
-      labs(title = "Ct of Internal Controls across Samples",
-           x = "Sample",
-           y = "Ct Value") +
-      theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  })
-
-  output$mirna_plots <- renderUI({
-    req(dataInput())
-    df <- dataInput()
-    mirna_targets <- setdiff(unique(df$Target), input$internal_controls)
-
-    plots <- lapply(mirna_targets, function(target) {
-      plot_data <- df %>% filter(Target == target)
-
-      plot_output <- renderPlot({
-        ggplot(plot_data, aes(x = Sample, y = Cq, fill = Type)) +
-          geom_bar(stat = "identity", position = position_dodge()) +
-          theme_minimal() +
-          labs(title = paste("Ct Values for", target), x = "Sample", y = "Ct") +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
-      })
-
-      plotOutput(outputId = paste0("mirna_plot_", target))
-    })
-    do.call(tagList, plots)
-  })
-
+  # enable analyze button only when basic prerequisites are met (clientside toggle)
   observe({
-    req(dataInput())
-    df <- dataInput()
-    mirna_targets <- setdiff(unique(df$Target), input$internal_controls)
+    enabled <- !is.null(input$normal_file) && !is.null(input$ref_gene) && length(input$ref_gene) > 0
+    session$sendCustomMessage(type = 'toggleAnalyze', message = list(enabled = enabled))
+  })
 
-    for (target in mirna_targets) {
+  # merged dataset with validation
+  merged_data <- reactive({
+    req(input$normal_file)
+    tryCatch(merge_inputs(input$normal_file, input$tumor_file), error = function(e) {
+      showNotification(as.character(e$message), type = "error", duration = 6)
+      NULL
+    })
+  })
+
+  # update picker choices when data loads
+  observeEvent(merged_data(), {
+    df <- merged_data()
+    if (is.null(df)) return()
+    targets <- sort(unique(df$Target))
+    updatePickerInput(session, "ref_gene", choices = targets)
+    updatePickerInput(session, "internal_controls", choices = targets)
+  })
+
+  # Run analysis on button click (with robust error handling)
+  analysis <- eventReactive(input$analyze, {
+    df <- merged_data()
+    validate(need(!is.null(df), "No valid data to analyze."))
+    validate(need(!is.null(input$ref_gene) && length(input$ref_gene) > 0, "Select at least one reference gene."))
+
+    withProgress(message = "Running ΔΔCt calculations...", value = 0, {
+      incProgress(0.1)
+      res <- tryCatch(calc_ddct_per_miRNA(df, input$ref_gene), error = function(e) {
+        showNotification(paste("Analysis failed:", e$message), type = "error", duration = 8)
+        NULL
+      })
+      incProgress(0.8)
+      res
+    })
+  })
+
+  # Analysis info
+  output$analysis_info <- renderPrint({
+    res <- analysis()
+    if (is.null(res)) {
+      cat("Analysis failed or returned no results. Check notifications for details.
+")
+      return()
+    }
+    cat("Analysis complete
+")
+    cat("Samples:", length(unique(res$wide$Sample)), "
+")
+    cat("Targets:", length(res$targets), "(examples:", paste(head(res$targets, 6), collapse = ", "), ")
+")
+    cat("Reference genes:", paste(input$ref_gene, collapse = ", "), "
+")
+  })
+
+  # Create UI for per-miRNA tables (excel-like three-block table per miRNA)
+  output$miRNA_tables_ui <- renderUI({
+    res <- analysis()
+    req(res)
+    tabs <- lapply(res$targets, function(t) {
+      info <- res$per_miRNA[[t]]
+      safe <- info$safe_id
+      fluidRow(
+        column(12, h4(sprintf("%s — %s", t, as.character(info$direction)))), 
+        column(12, DTOutput(paste0("excel_table_", safe))),
+        hr()
+      )
+    })
+    do.call(tagList, tabs)
+  })
+
+  # render each excel-like table
+  observeEvent(analysis(), {
+    res <- analysis()
+    if (is.null(res)) return()
+    lapply(res$targets, function(t) {
       local({
-        local_target <- target
-        output[[paste0("mirna_plot_", local_target)]] <- renderPlot({
-          plot_data <- df %>% filter(Target == local_target)
-          ggplot(plot_data, aes(x = Sample, y = Cq, fill = Type)) +
-            geom_bar(stat = "identity", position = position_dodge()) +
-            theme_minimal() +
-            labs(title = paste("Ct Values for", local_target), x = "Sample", y = "Ct") +
-            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        info <- res$per_miRNA[[t]]
+        safe <- info$safe_id
+        output[[paste0("excel_table_", safe)]] <- renderDT({
+          dat <- tryCatch(as.data.frame(info$excel_like), error = function(e) data.frame(Note = 'Failed to convert table'))
+          # small cosmetic: replace NA with empty string for readability in DT
+          dat[is.na(dat)] <- ""
+          datatable(dat, options = list(scrollX = TRUE, pageLength = 15))
+        })
+      })
+    })
+  })
+
+  # Plots: internal controls
+  output$internal_controls_plot <- renderPlotly({
+    req(merged_data(), input$internal_controls)
+    df <- merged_data() %>% filter(Target %in% input$internal_controls)
+    p <- ggplot(df, aes(x = Sample, y = Cq, fill = Target)) + geom_col(position = position_dodge()) + theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs(title = "Internal controls (Ct)")
+    ggplotly(p, tooltip = c("x","y","fill"))
+  })
+
+  # Generate UI for miRNA plots
+  output$miRNA_plots_ui <- renderUI({
+    res <- analysis()
+    req(res)
+    plot_outputs <- lapply(res$targets, function(t) {
+      safe <- res$per_miRNA[[t]]$safe_id
+      tagList(h4(t), plotlyOutput(outputId = paste0("plot_", safe), height = "280px"), br())
+    })
+    do.call(tagList, plot_outputs)
+  })
+
+  # Render miRNA plots
+  observeEvent(analysis(), {
+    res <- analysis()
+    if (is.null(res)) return()
+    for (t in res$targets) {
+      local({
+        info <- res$per_miRNA[[t]]
+        safe <- info$safe_id
+        output[[paste0("plot_", safe)]] <- renderPlotly({
+          p <- plot_miRNA(info$raw, t)
+          ggplotly(p, tooltip = c("x","y","fill"))
         })
       })
     }
   })
 
+  # Download results: xlsx with per-miRNA sheets (excel-like table + raw + summaries)
   output$download_results <- downloadHandler(
-    filename = function() {
-      paste0("ddct_results_", Sys.Date(), ".xlsx")
-    },
+    filename = function() paste0("ddct_results_", Sys.Date(), ".xlsx"),
     content = function(file) {
-      result <- analysis()
-      wb <- createWorkbook()
-      addWorksheet(wb, "Normal")
-      writeData(wb, "Normal", result$normal)
-      addWorksheet(wb, "Tumor")
-      writeData(wb, "Tumor", result$tumor)
-      saveWorkbook(wb, file)
-    }
-  )
-
-  output$download_plot_excel <- downloadHandler(
-    filename = function() {
-      paste0("Internal_Controls_Plot_", Sys.Date(), ".xlsx")
-    },
-    content = function(file) {
-      req(dataInput(), input$internal_controls)
-      df <- dataInput()
-      internal_controls <- df %>% filter(Target %in% input$internal_controls)
-
-      p <- ggplot(internal_controls, aes(x = Sample, y = Cq, fill = Target)) +
-        geom_bar(stat = "identity", position = position_dodge()) +
-        theme_minimal() +
-        labs(title = "Ct of Internal Controls across Samples",
-             x = "Sample",
-             y = "Ct Value") +
-        theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-      tmpfile <- tempfile(fileext = ".png")
-      ggsave(tmpfile, plot = p, width = 8, height = 5)
-
-      wb <- createWorkbook()
-      addWorksheet(wb, "Internal Controls Plot")
-      insertImage(wb, sheet = 1, tmpfile, startRow = 1, startCol = 1, width = 15, height = 6)
-      saveWorkbook(wb, file)
-    }
-  )
-
-  output$download_mirna_plots_excel <- downloadHandler(
-    filename = function() {
-      paste0("miRNA_Ct_Plots_", Sys.Date(), ".xlsx")
-    },
-    content = function(file) {
-      df <- dataInput()
-      mirna_targets <- setdiff(unique(df$Target), input$internal_controls)
-
+      res <- analysis()
+      if (is.null(res)) {
+        showNotification("No analysis results to download.", type = "error")
+        return()
+      }
       wb <- createWorkbook()
 
-      for (target in mirna_targets) {
-        plot_data <- df %>% filter(Target == target)
+      addWorksheet(wb, "wide")
+      writeData(wb, "wide", res$wide)
 
-        p <- ggplot(plot_data, aes(x = Sample, y = Cq, fill = Type)) +
-          geom_bar(stat = "identity", position = position_dodge()) +
-          theme_minimal() +
-          labs(title = paste("Ct Values for", target), x = "Sample", y = "Ct") +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-        tmpfile <- tempfile(fileext = ".png")
-        ggsave(tmpfile, plot = p, width = 8, height = 5)
-
-        addWorksheet(wb, target)
-        insertImage(wb, sheet = target, file = tmpfile, startRow = 1, startCol = 1, width = 15, height = 6)
+      for (t in res$targets) {
+        info <- res$per_miRNA[[t]]
+        sheet_name <- substr(info$safe_id, 1, 30)
+        addWorksheet(wb, sheet_name)
+        writeData(wb, sheet_name, info$excel_like, startCol = 1, startRow = 1)
+        addWorksheet(wb, paste0(sheet_name, "_raw"))
+        writeData(wb, paste0(sheet_name, "_raw"), info$raw)
+        addWorksheet(wb, paste0(sheet_name, "_normal_summary"))
+        writeData(wb, paste0(sheet_name, "_normal_summary"), info$normal_summary)
+        addWorksheet(wb, paste0(sheet_name, "_tumor_summary"))
+        writeData(wb, paste0(sheet_name, "_tumor_summary"), info$tumor_summary)
       }
 
-      saveWorkbook(wb, file)
+      meta <- data.frame(Generated = as.character(Sys.time()), References = paste(input$ref_gene, collapse = ", "))
+      addWorksheet(wb, "metadata"); writeData(wb, "metadata", meta)
+
+      saveWorkbook(wb, file, overwrite = TRUE)
     }
   )
+
+  # Download plots: zip of pngs (restored) with error handling
+  output$download_plots_zip <- downloadHandler(
+    filename = function() paste0("ddct_plots_", Sys.Date(), ".zip"),
+    content = function(zipfile) {
+      res <- analysis()
+      if (is.null(res)) {
+        showNotification("No analysis results to download.", type = "error")
+        return()
+      }
+      tmpdir <- tempdir()
+      pngs <- c()
+
+      # internal control
+      if (!is.null(input$internal_controls) && length(input$internal_controls) > 0) {
+        p_ctrl <- ggplot(merged_data() %>% filter(Target %in% input$internal_controls), aes(x = Sample, y = Cq, fill = Target)) + geom_col(position = position_dodge()) + theme_minimal() + labs(title = "Internal controls") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        out <- file.path(tmpdir, "internal_controls.png")
+        tryCatch({ ggsave(out, plot = p_ctrl, width = 10, height = 4); pngs <- c(pngs, out) }, error = function(e) showNotification(paste("Failed to save internal control plot:", e$message), type = "error"))
+      }
+
+      for (t in res$targets) {
+        p <- plot_miRNA(res$per_miRNA[[t]]$raw, t)
+        out <- file.path(tmpdir, paste0("ct_", sanitize_id(t), ".png"))
+        tryCatch({ ggsave(out, plot = p, width = 10, height = 4); pngs <- c(pngs, out) }, error = function(e) showNotification(paste("Failed to save plot for", t, e$message), type = "error"))
+      }
+
+      if (length(pngs) == 0) {
+        showNotification("No plots were generated to include in the zip.", type = "error")
+        return()
+      }
+
+      oldwd <- setwd(tmpdir)
+      on.exit(setwd(oldwd), add = TRUE)
+      zip(zipfile, files = basename(pngs))
+    }
+  )
+
+  # Download plots: excel with embedded images (error-handled)
+  output$download_plots_excel <- downloadHandler(
+    filename = function() paste0("ddct_plots_", Sys.Date(), ".xlsx"),
+    content = function(file) {
+      res <- analysis()
+      if (is.null(res)) {
+        showNotification("No analysis results to download.", type = "error")
+        return()
+      }
+      wb <- createWorkbook()
+      for (t in res$targets) {
+        safe <- sanitize_id(t)
+        sheet_name <- substr(safe, 1, 30)
+        addWorksheet(wb, sheet_name)
+        plot_path <- tempfile(fileext = ".png")
+        tryCatch({
+          ggsave(plot_path, plot = plot_miRNA(res$per_miRNA[[t]]$raw, t), width = 10, height = 4)
+          insertImage(wb, sheet_name, plot_path, startCol = 1, startRow = 1, width = 15, height = 5, units = "in")
+        }, error = function(e) {
+          showNotification(paste("Failed to save/insert plot for", t, e$message), type = "error")
+          writeData(wb, sheet_name, data.frame(Note = paste("Plot generation failed:", e$message)))
+        })
+      }
+      saveWorkbook(wb, file, overwrite = TRUE)
+    }
+  )
+
+  # small client-side handler to enable/disable analyze button
+  session$sendCustomMessage(type = 'initToggle', message = list())
+
 }
 
-shinyApp(ui, server)
+# JS for toggling analyze button (injected)
+js <- "Shiny.addCustomMessageHandler('initToggle', function(msg) { });
+Shiny.addCustomMessageHandler('toggleAnalyze', function(msg) { var btn = document.getElementById('analyze'); if (!btn) return; if (msg.enabled) { btn.removeAttribute('disabled'); } else { btn.setAttribute('disabled', 'disabled'); } });"
+
+# Run app
+shinyApp(ui = tagList(ui, tags$script(HTML(js))), server)
