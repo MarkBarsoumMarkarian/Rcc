@@ -43,7 +43,6 @@ merge_inputs <- function(normal_file, tumor_file = NULL) {
   bind_rows(normal_df, tumor_df)
 }
 
-# sanitize output IDs so special characters in miRNA names don't break Shiny
 sanitize_id <- function(x) {
   x <- as.character(x)
   x <- gsub("[^A-Za-z0-9_]", "_", x)
@@ -53,7 +52,6 @@ sanitize_id <- function(x) {
   x
 }
 
-# make a vector of unique safe ids from targets (append suffix if needed)
 unique_safe_ids <- function(targets) {
   safe <- sapply(targets, sanitize_id)
   dupes <- which(duplicated(safe) | duplicated(safe, fromLast = TRUE))
@@ -67,19 +65,14 @@ unique_safe_ids <- function(targets) {
   safe
 }
 
-# Given an info object (from calc_ddct_per_miRNA), build a combined table matching the Excel layout:
-# Left block = Normal samples (Sample, Cq, dCt, FC), Middle block = Tumor samples (Sample, Cq, dCt, ddCt, FC),
-# Right block = Summary (Group, Fold Change, SEM, Significance).
 build_excel_like_table <- function(info) {
   raw <- info$raw
-  normal <- raw %>% filter(Type == "Normal") %>% arrange(Sample) %>% select(Sample, Cq, dCt, ddCt, FC)
-  tumor  <- raw %>% filter(Type == "Tumor")  %>% arrange(Sample) %>% select(Sample, Cq, dCt, ddCt, FC)
+  normal <- raw %>% filter(Type == "Normal") %>% select(Sample, Cq, dCt, ddCt, FC)
+  tumor  <- raw %>% filter(Type == "Tumor")  %>% select(Sample, Cq, dCt, ddCt, FC)
 
-  # pad so both have same number of rows
   nmax <- max(nrow(normal), nrow(tumor), 1)
   pad_rows <- function(df, n) {
     if (nrow(df) < n) {
-      # create extra rows with same columns
       extra <- data.frame(matrix(NA, n - nrow(df), ncol(df)))
       colnames(extra) <- colnames(df)
       df <- bind_rows(df, extra)
@@ -89,11 +82,9 @@ build_excel_like_table <- function(info) {
   normal_p <- pad_rows(normal, nmax)
   tumor_p  <- pad_rows(tumor, nmax)
 
-  # rename columns to indicate block
   colnames(normal_p) <- paste0("Normal_", c("Sample","Cq","dCt","ddCt","FC"))
   colnames(tumor_p)  <- paste0("Tumor_",  c("Sample","Cq","dCt","ddCt","FC"))
 
-  # summary: compute group-level Fold Change, SEM, Significance (NA by default)
   summarize_group <- function(dfgroup) {
     if (nrow(dfgroup) == 0) return(data.frame(FoldChange = NA_real_, SEM = NA_real_, Significance = NA_real_))
     fc_vec <- dfgroup$FC
@@ -107,7 +98,6 @@ build_excel_like_table <- function(info) {
   normal_sum <- summarize_group(normal %>% filter(!is.na(FC)))
   tumor_sum  <- summarize_group(tumor %>% filter(!is.na(FC)))
 
-  # Build a summary block with nmax rows, first row = Normal summary, second = Tumor summary, others NA
   summary_block <- data.frame(
     Group = rep(NA_character_, nmax),
     FoldChange = rep(NA_real_, nmax),
@@ -130,7 +120,6 @@ build_excel_like_table <- function(info) {
 
   combined <- bind_cols(normal_p, tumor_p, summary_block)
 
-  # Round numeric columns for display like your Excel
   num_cols <- sapply(combined, is.numeric)
   combined[num_cols] <- lapply(combined[num_cols], function(x) ifelse(is.na(x), NA, round(x, 4)))
 
@@ -142,7 +131,6 @@ calc_ddct_per_miRNA <- function(df, ref_genes) {
   if (length(ref_genes) < 1) stop("At least one reference gene must be selected.")
   if (!all(ref_genes %in% df$Target)) stop("Some selected reference genes are not present in the data.")
 
-  # aggregate technical replicates
   df_agg <- df %>% group_by(Sample, Target, Type) %>% summarise(Cq = mean(Cq, na.rm = TRUE), .groups = 'drop')
   df_wide <- df_agg %>% pivot_wider(names_from = Target, values_from = Cq)
 
@@ -157,17 +145,14 @@ calc_ddct_per_miRNA <- function(df, ref_genes) {
 
   if (length(targets) == 0) stop("No miRNA targets found in the dataset after processing.")
 
-  # compute dCt columns
   for (t in targets) {
     df_wide[[paste0("dCt_", t)]] <- df_wide[[t]] - df_wide$Ct_ref
   }
 
-  # mean dCt across Normal samples
   normal_rows <- df_wide %>% filter(Type == "Normal")
   normal_mean_dCt <- list()
   for (t in targets) normal_mean_dCt[[t]] <- mean(normal_rows[[paste0("dCt_", t)]], na.rm = TRUE)
 
-  # create unique safe IDs for targets
   safe_map <- unique_safe_ids(targets)
 
   per_miRNA <- list()
@@ -179,7 +164,6 @@ calc_ddct_per_miRNA <- function(df, ref_genes) {
       rename(Cq = all_of(t), dCt = all_of(dct_col)) %>%
       mutate(ddCt = dCt - normal_mean_dCt[[t]], FC = 2^(-ddCt))
 
-    # summaries for Normal and Tumor groups
     normal_tbl <- tbl %>% filter(Type == "Normal")
     tumor_tbl  <- tbl %>% filter(Type == "Tumor")
 
@@ -206,14 +190,11 @@ calc_ddct_per_miRNA <- function(df, ref_genes) {
       else direction <- "No change"
     }
 
-    # Build combined table to replicate your Excel layout
     combined_table <- tryCatch(build_excel_like_table(list(raw = tbl)), error = function(e) {
-      # fallback: create a minimal table
       warning(sprintf("Failed to build excel-like table for %s: %s", t, e$message))
       return(data.frame(Note = "Failed to format table"))
     })
 
-    # ensure direction is plain character and excel_like is a data.frame
     direction <- as.character(direction)
     excel_like_df <- tryCatch({
       if (is.data.frame(combined_table)) combined_table else as.data.frame(combined_table)
@@ -242,6 +223,10 @@ plot_miRNA <- function(tbl, target_name) {
     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
     labs(title = paste0("Ct values — ", target_name), y = "Cq", x = "Sample")
 }
+
+# -------------------- UI ----------------------------------------------------------------
+# (UI and server code remain unchanged except for removal of arrange in build_excel_like_table)
+
 
 # -------------------- UI ----------------------------------------------------------------
 ui <- fluidPage(
@@ -541,3 +526,4 @@ Shiny.addCustomMessageHandler('toggleAnalyze', function(msg) { var btn = documen
 
 # Run app
 shinyApp(ui = tagList(ui, tags$script(HTML(js))), server)
+
