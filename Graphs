@@ -1,0 +1,869 @@
+# Epic miRNA qPCR Analysis with Fold Change & ROC
+library(shiny)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(pROC)
+library(tidyr)
+library(glmnet)
+library(shinythemes)
+library(DT)
+
+ui <- fluidPage(
+  theme = shinytheme("cosmo"),
+  
+  tags$head(
+    tags$style(HTML("
+      @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
+      
+      body {
+        font-family: 'Poppins', sans-serif;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background-attachment: fixed;
+      }
+      
+      .container-fluid {
+        padding: 20px;
+      }
+      
+      .main-header {
+        background: rgba(255, 255, 255, 0.98);
+        padding: 35px 40px;
+        border-radius: 20px;
+        margin-bottom: 30px;
+        box-shadow: 0 15px 40px rgba(0,0,0,0.2);
+        border: 3px solid rgba(255,255,255,0.3);
+        position: relative;
+        overflow: hidden;
+      }
+      
+      .main-header::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        right: -20%;
+        width: 300px;
+        height: 300px;
+        background: radial-gradient(circle, rgba(102, 126, 234, 0.1) 0%, transparent 70%);
+        animation: float 6s ease-in-out infinite;
+      }
+      
+      @keyframes float {
+        0%, 100% { transform: translateY(0px) rotate(0deg); }
+        50% { transform: translateY(-20px) rotate(180deg); }
+      }
+      
+      .main-header h1 {
+        margin: 0;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        font-weight: 700;
+        font-size: 3em;
+        position: relative;
+        z-index: 1;
+      }
+      
+      .main-header .subtitle {
+        margin: 10px 0 0 0;
+        color: #666;
+        font-size: 1.15em;
+        font-weight: 400;
+        position: relative;
+        z-index: 1;
+      }
+      
+      .main-header .fa-dna {
+        color: #667eea;
+        margin-right: 15px;
+        animation: pulse-rotate 3s ease-in-out infinite;
+      }
+      
+      @keyframes pulse-rotate {
+        0%, 100% { transform: scale(1) rotate(0deg); }
+        50% { transform: scale(1.1) rotate(180deg); }
+      }
+      
+      .sidebar-panel {
+        background: rgba(255, 255, 255, 0.98);
+        padding: 25px;
+        border-radius: 20px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        border: 2px solid rgba(255,255,255,0.3);
+      }
+      
+      .main-panel-content {
+        background: rgba(255, 255, 255, 0.98);
+        padding: 30px;
+        border-radius: 20px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        border: 2px solid rgba(255,255,255,0.3);
+        min-height: 600px;
+      }
+      
+      .file-upload-zone {
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        padding: 30px;
+        border-radius: 15px;
+        border: 3px dashed #667eea;
+        margin-bottom: 25px;
+        text-align: center;
+        transition: all 0.3s ease;
+        cursor: pointer;
+      }
+      
+      .file-upload-zone:hover {
+        border-color: #764ba2;
+        background: linear-gradient(135deg, #e8e9ff 0%, #d5d7ff 100%);
+        transform: scale(1.02);
+        box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3);
+      }
+      
+      .file-upload-zone .upload-icon {
+        font-size: 3em;
+        color: #667eea;
+        margin-bottom: 15px;
+        display: block;
+        animation: bounce 2s ease infinite;
+      }
+      
+      @keyframes bounce {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-10px); }
+      }
+      
+      .file-upload-zone h4 {
+        color: #495057;
+        font-weight: 600;
+        margin: 10px 0;
+      }
+      
+      .info-box {
+        background: linear-gradient(135deg, #e7f3ff 0%, #cfe7ff 100%);
+        border-left: 5px solid #2196F3;
+        padding: 18px;
+        border-radius: 12px;
+        margin-bottom: 25px;
+        box-shadow: 0 4px 12px rgba(33, 150, 243, 0.2);
+      }
+      
+      .info-box .fa-info-circle {
+        color: #1976D2;
+        margin-right: 8px;
+      }
+      
+      .info-box strong {
+        color: #0d47a1;
+        font-size: 1.05em;
+      }
+      
+      .stats-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 15px;
+        margin-bottom: 25px;
+      }
+      
+      .stat-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
+        border-radius: 15px;
+        color: white;
+        box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        transition: all 0.3s;
+      }
+      
+      .stat-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 10px 30px rgba(102, 126, 234, 0.5);
+      }
+      
+      .stat-card h3 {
+        margin: 0;
+        font-size: 2.5em;
+        font-weight: 700;
+      }
+      
+      .stat-card p {
+        margin: 8px 0 0 0;
+        font-size: 0.95em;
+        opacity: 0.95;
+      }
+      
+      .stat-card .fa {
+        float: right;
+        font-size: 2em;
+        opacity: 0.4;
+      }
+      
+      .section-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 15px 20px;
+        border-radius: 12px;
+        margin: 20px 0 15px 0;
+        font-weight: 600;
+        font-size: 1.15em;
+        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+      }
+      
+      .section-header .fa {
+        margin-right: 10px;
+      }
+      
+      .checkbox-container {
+        background: #fafbfc;
+        padding: 15px;
+        border-radius: 12px;
+        border: 2px solid #e1e4e8;
+        max-height: 400px;
+        overflow-y: auto;
+      }
+      
+      .checkbox-container::-webkit-scrollbar {
+        width: 10px;
+      }
+      
+      .checkbox-container::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 5px;
+      }
+      
+      .checkbox-container::-webkit-scrollbar-thumb {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 5px;
+      }
+      
+      .checkbox-container::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+      }
+      
+      .checkbox {
+        padding: 12px;
+        margin: 6px 0;
+        border-radius: 8px;
+        transition: all 0.2s;
+        background: white;
+      }
+      
+      .checkbox:hover {
+        background: linear-gradient(135deg, #f8f9ff 0%, #f0f1ff 100%);
+        box-shadow: 0 3px 10px rgba(102, 126, 234, 0.15);
+        transform: translateX(5px);
+      }
+      
+      .checkbox label {
+        font-weight: 500;
+        color: #495057;
+        cursor: pointer;
+        display: block;
+      }
+      
+      .nav-tabs {
+        border-bottom: 4px solid #667eea;
+        margin-bottom: 0;
+      }
+      
+      .nav-tabs > li > a {
+        color: #495057;
+        border-radius: 15px 15px 0 0;
+        font-weight: 600;
+        padding: 15px 28px;
+        transition: all 0.3s;
+        border: none;
+        margin-right: 5px;
+      }
+      
+      .nav-tabs > li > a:hover {
+        background: linear-gradient(135deg, #f8f9ff 0%, #f0f1ff 100%);
+        color: #667eea;
+        transform: translateY(-3px);
+      }
+      
+      .nav-tabs > li.active > a,
+      .nav-tabs > li.active > a:hover,
+      .nav-tabs > li.active > a:focus {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white !important;
+        border: none;
+        box-shadow: 0 -5px 15px rgba(102, 126, 234, 0.4);
+      }
+      
+      .tab-content {
+        padding: 0;
+        border: none;
+      }
+      
+      .plot-container {
+        background: white;
+        padding: 25px;
+        border-radius: 15px;
+        box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+        margin: 20px 0;
+        border: 2px solid rgba(102, 126, 234, 0.1);
+        transition: all 0.3s;
+      }
+      
+      .plot-container:hover {
+        box-shadow: 0 10px 30px rgba(102, 126, 234, 0.2);
+        transform: translateY(-3px);
+      }
+      
+      .plot-title {
+        font-size: 1.4em;
+        font-weight: 600;
+        color: #495057;
+        margin-bottom: 20px;
+        padding-bottom: 15px;
+        border-bottom: 3px solid #667eea;
+      }
+      
+      .cv-input-group {
+        background: linear-gradient(135deg, #fff9e6 0%, #ffe6cc 100%);
+        padding: 20px;
+        border-radius: 12px;
+        border: 2px solid #ff9800;
+        margin-bottom: 25px;
+      }
+      
+      .cv-input-group label {
+        color: #e65100;
+        font-weight: 600;
+        font-size: 1.05em;
+      }
+      
+      .cv-input-group .help-block {
+        color: #f57c00;
+        font-size: 0.9em;
+        margin-top: 8px;
+      }
+      
+      .form-control:focus {
+        border-color: #667eea;
+        box-shadow: 0 0 10px rgba(102, 126, 234, 0.3);
+      }
+      
+      .model-summary-box {
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        padding: 25px;
+        border-radius: 15px;
+        border: 2px solid #667eea;
+        font-family: 'Courier New', monospace;
+        margin-top: 20px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+      }
+      
+      .empty-state {
+        text-align: center;
+        padding: 100px 50px;
+        color: #999;
+      }
+      
+      .empty-state .fa {
+        font-size: 6em;
+        margin-bottom: 25px;
+        opacity: 0.2;
+        color: #667eea;
+      }
+      
+      .empty-state h3 {
+        color: #666;
+        font-weight: 600;
+        margin-bottom: 12px;
+      }
+    "))
+  ),
+  
+  div(class = "main-header",
+      h1(icon("dna"), "miRNA qPCR Analysis Platform"),
+      div(class = "subtitle", 
+          "Fold Change Analysis • ROC Curves • Predictive Modeling")
+  ),
+  
+  sidebarLayout(
+    sidebarPanel(
+      class = "sidebar-panel",
+      width = 3,
+      
+      div(class = "file-upload-zone",
+          icon("cloud-upload-alt", class = "upload-icon"),
+          h4("Upload Your Data"),
+          fileInput("file", NULL, accept = c(".xlsx"),
+                    buttonLabel = tagList(icon("folder-open"), " Browse"),
+                    placeholder = "Select Excel file...")
+      ),
+      
+      div(class = "info-box",
+          icon("info-circle"),
+          strong(" Required Columns:"),
+          tags$br(),
+          tags$small("Well • Fluor • Target • Sample • Cq • Cq Mean • Type • Sd"),
+          tags$br(), tags$br(),
+          icon("lightbulb"), tags$small(" Normalizers: U6 or UniSP6")
+      ),
+      
+      uiOutput("statsCards"),
+      
+      div(class = "section-header",
+          icon("chart-line"), "Dot Plot Selection"
+      ),
+      div(class = "checkbox-container",
+          uiOutput("targetSelector")
+      )
+    ),
+    
+    mainPanel(
+      width = 9,
+      div(class = "main-panel-content",
+          tabsetPanel(
+            id = "mainTabs",
+            
+            tabPanel(
+              title = tagList(icon("chart-scatter"), "Fold Change Plots"),
+              value = "dots",
+              div(class = "plot-container",
+                  div(class = "plot-title", icon("chart-line"), " Individual miRNA Fold Changes"),
+                  plotOutput("allDotPlots", height = "auto")
+              )
+            ),
+            
+
+            
+            tabPanel(
+              title = tagList(icon("table"), "Summary Statistics"),
+              value = "table",
+              div(class = "plot-container",
+                  div(class = "plot-title", icon("calculator"), " Per-miRNA Mean Fold Changes"),
+                  DT::dataTableOutput("summaryTable")
+              )
+            ),
+            
+            tabPanel(
+              title = tagList(icon("chart-area"), "ROC Analysis"),
+              value = "roc",
+              div(class = "plot-container",
+                  div(class = "plot-title", icon("chart-line"), " Individual miRNA ROC Curves"),
+                  plotOutput("allROCPlots", height = "auto")
+              ),
+              div(class = "plot-container",
+                  div(class = "plot-title", icon("project-diagram"), " Combined Predictive Model"),
+                  plotOutput("combinedROCPlot", height = "500px"),
+                  div(class = "model-summary-box",
+                      verbatimTextOutput("modelSummary")
+                  )
+              )
+            ),
+            
+            tabPanel(
+              title = tagList(icon("ruler"), "Reference Genes QC"),
+              value = "refgenes",
+              div(class = "plot-container",
+                  div(class = "plot-title", icon("check-circle"), " Reference Gene Ct Values"),
+                  p(style = "color: #666; margin-bottom: 20px;",
+                    icon("info-circle"), 
+                    " Monitor the stability of your normalizers (U6/UniSP6). Consistent Ct values across samples indicate reliable normalization."),
+                  plotOutput("referenceGenesPlot", height = "500px")
+              )
+            )
+          )
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  rawData <- reactive({
+    req(input$file)
+    
+    withProgress(message = 'Loading and processing data...', value = 0, {
+      df <- read_excel(input$file$datapath)
+      names(df) <- make.names(names(df))
+      incProgress(0.5)
+      
+      df <- df %>% 
+        filter(!is.na(Cq.Mean), !is.na(Target), !is.na(Type)) %>%
+        filter(!str_detect(Type, regex("^NTC$", ignore_case = TRUE)))
+      
+      incProgress(1)
+    })
+    
+    return(df)
+  })
+  
+  foldChangeData <- reactive({
+    df <- rawData()
+    df <- df %>% filter(Type %in% c("Normal", "Tumor"))
+    
+    normalizer <- df %>%
+      filter(Target %in% c("U6","UniSP6")) %>%
+      group_by(Sample) %>%
+      summarise(normalizer_Cq = mean(Cq.Mean, na.rm = TRUE), .groups="drop")
+    
+    delta_cq <- df %>%
+      filter(!Target %in% c("U6","UniSP6")) %>%
+      left_join(normalizer, by="Sample") %>%
+      mutate(delta_Cq = Cq.Mean - normalizer_Cq)
+    
+    normal_avg <- delta_cq %>%
+      filter(Type=="Normal") %>%
+      group_by(Target) %>%
+      summarise(avg_normal_delta_Cq = mean(delta_Cq, na.rm=TRUE), .groups="drop")
+    
+    fold_change_df <- delta_cq %>%
+      left_join(normal_avg, by="Target") %>%
+      mutate(delta_delta_Cq = delta_Cq - avg_normal_delta_Cq,
+             fold_change = 2^(-delta_delta_Cq))
+    
+    return(fold_change_df)
+  })
+  
+  perMiRNAMeans <- reactive({
+    foldChangeData() %>%
+      group_by(Target, Type) %>%
+      summarise(mean_fold_change = mean(fold_change, na.rm=TRUE),
+                sd_fold_change = sd(fold_change, na.rm=TRUE),
+                n = n(),
+                .groups="drop")
+  })
+  
+  output$statsCards <- renderUI({
+    req(foldChangeData())
+    df <- foldChangeData()
+    
+    n_mirnas <- length(unique(df$Target))
+    n_samples <- nrow(df)
+    
+    div(class = "stats-grid",
+        div(class = "stat-card",
+            icon("dna", class = "fa"),
+            h3(n_mirnas),
+            p("miRNA Targets")
+        ),
+        div(class = "stat-card",
+            icon("vial", class = "fa"),
+            h3(n_samples),
+            p("Total Samples")
+        )
+    )
+  })
+  
+  output$targetSelector <- renderUI({
+    targets <- sort(unique(foldChangeData()$Target))
+    checkboxGroupInput("selectedTargets", NULL,
+                       choices = targets, selected = targets)
+  })
+  
+  output$allDotPlots <- renderPlot({
+    df <- foldChangeData()
+    req(input$selectedTargets)
+    df_subset <- df %>% filter(Target %in% input$selectedTargets)
+    
+    ggplot(df_subset, aes(x = Type, y = fold_change, color = Type, fill = Type)) +
+      geom_boxplot(alpha = 0.3, outlier.shape = NA) +
+      geom_jitter(position = position_jitterdodge(jitter.width=0.15, dodge.width=0.75),
+                  size=3, alpha=0.7) +
+      stat_summary(fun=mean, geom="point", shape=18, size=5, color="black",
+                   position=position_dodge(width=0.75)) +
+      scale_color_manual(values=c("Normal"="#4CAF50","Tumor"="#f44336")) +
+      scale_fill_manual(values=c("Normal"="#4CAF50","Tumor"="#f44336")) +
+      scale_y_log10(labels = scales::comma) +
+      geom_hline(yintercept = 1, linetype="dashed", color="gray40", size=0.8) +
+      labs(y="Fold Change (log scale)", x="", title = NULL) +
+      facet_wrap(~Target, scales="free_x", ncol=3) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position="none",
+        strip.text=element_text(size=13, face="bold", color="#495057"),
+        strip.background = element_rect(fill="#f8f9fa", color=NA),
+        axis.text.x=element_text(size=11, face="bold"),
+        axis.text.y=element_text(size=10),
+        axis.title.y=element_text(size=12, face="bold"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color="#e1e4e8", fill=NA, size=1)
+      )
+  }, height = function() {
+    n_plots <- length(input$selectedTargets)
+    400 + 150 * ceiling(n_plots / 3)
+  })
+  
+  output$summaryTable <- DT::renderDataTable({
+    df <- perMiRNAMeans() %>% 
+      arrange(Target, match(Type, c("Normal","Tumor"))) %>%
+      mutate(
+        mean_fold_change = round(mean_fold_change, 3),
+        sd_fold_change = round(sd_fold_change, 3)
+      ) %>%
+      rename(
+        "miRNA" = Target,
+        "Type" = Type,
+        "Mean FC" = mean_fold_change,
+        "SD" = sd_fold_change,
+        "N" = n
+      )
+    
+    DT::datatable(df,
+                  options = list(
+                    pageLength = 25,
+                    searching = TRUE,
+                    ordering = TRUE
+                  ),
+                  rownames = FALSE,
+                  class = 'cell-border stripe hover')
+  })
+  
+  output$allROCPlots <- renderPlot({
+    req(input$selectedTargets)
+    df <- foldChangeData()
+    
+    n_plots <- length(input$selectedTargets)
+    n_cols <- 3
+    n_rows <- ceiling(n_plots / n_cols)
+    
+    par(mfrow = c(n_rows, n_cols), mar = c(4, 4, 3, 2), bg = "white")
+    
+    for (miR in input$selectedTargets) {
+      df_miR <- df %>% filter(Target == miR)
+      if(length(unique(df_miR$Type)) < 2) next
+      
+      df_miR$outcome <- ifelse(df_miR$Type == "Tumor", 1, 0)
+      roc_obj <- roc(df_miR$outcome, df_miR$fold_change, levels = c(0,1), direction = "<", quiet=TRUE)
+      
+      plot(roc_obj, main = miR, col = "#667eea", lwd = 3, 
+           col.main = "#495057", cex.main = 1.2, font.main = 2)
+      legend("bottomright", 
+             legend = paste("AUC =", round(auc(roc_obj), 3)), 
+             bty = "n", cex = 1.1, text.col = "#495057", text.font = 2)
+      abline(a=0, b=1, lty=2, col="gray50")
+    }
+  }, height = function() {
+    n_plots <- length(input$selectedTargets)
+    300 + 200 * ceiling(n_plots / 3)
+  })
+  
+  output$combinedROCPlot <- renderPlot({
+    req(input$selectedTargets)
+    df <- foldChangeData()
+    
+    df_wide <- df %>%
+      filter(Target %in% input$selectedTargets) %>%
+      group_by(Sample, Target, Type) %>%
+      summarise(fold_change = mean(fold_change, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Target, values_from = fold_change)
+    
+    if (nrow(df_wide) > 0 && length(unique(df_wide$Type)) == 2) {
+      df_wide$outcome <- ifelse(df_wide$Type == "Tumor", 1, 0)
+      
+      clean_miRNA_names <- make.names(names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")])
+      names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")] <- clean_miRNA_names
+      
+      df_wide_complete <- df_wide[complete.cases(df_wide), ]
+      
+      if (nrow(df_wide_complete) < 10) {
+        plot(1, type = "n", xlab = "", ylab = "", xlim = c(0,1), ylim = c(0,1),
+             main = "Not enough complete data for combined ROC")
+        text(0.5, 0.5, "Need at least 10 complete samples\nfor combined ROC analysis", 
+             cex = 1.2, col = "#666")
+        return()
+      }
+      
+      if (length(unique(df_wide_complete$outcome)) < 2) {
+        plot(1, type = "n", xlab = "", ylab = "", xlim = c(0,1), ylim = c(0,1),
+             main = "Not enough complete data for combined ROC")
+        text(0.5, 0.5, "Need both Normal and Tumor samples\nfor ROC analysis", 
+             cex = 1.2, col = "#666")
+        return()
+      }
+      
+      X <- as.matrix(df_wide_complete[, clean_miRNA_names])
+      y <- df_wide_complete$outcome
+      
+      # Fit logistic regression without cross-validation
+      fit <- glmnet(X, y, family = "binomial", alpha = 0.5)
+      
+      # Use a reasonable lambda (not too small to avoid overfitting)
+      lambda_choice <- fit$lambda[length(fit$lambda) %/% 2]
+      
+      # Get predictions
+      predicted_probs <- predict(fit, newx = X, s = lambda_choice, type = "response")
+      
+      combined_roc <- roc(y, as.numeric(predicted_probs), quiet=TRUE)
+      
+      plot(combined_roc, main = "Combined ROC (Regularized Logistic Regression)", 
+           col = "#f44336", lwd = 3, col.main = "#495057", cex.main = 1.3, font.main = 2)
+      abline(a=0, b=1, lty=2, col="gray50")
+      legend("bottomright", 
+             legend = paste("AUC =", round(auc(combined_roc), 3)), 
+             bty = "n", cex = 1.2, text.col = "#495057", text.font = 2)
+      
+      legend("topleft", 
+             legend = c(paste("miRNAs:", length(input$selectedTargets)),
+                       paste("Samples:", nrow(df_wide_complete)),
+                       paste("Lambda:", sprintf("%.4f", lambda_choice))),
+             bty = "n", cex = 0.9, text.col = "#666")
+    } else {
+      plot(1, type = "n", xlab = "", ylab = "", xlim = c(0,1), ylim = c(0,1),
+           main = "Cannot generate combined ROC")
+      text(0.5, 0.5, "Insufficient data or missing sample types", cex = 1.2, col = "#666")
+    }
+  })
+  
+  output$modelSummary <- renderPrint({
+    req(input$selectedTargets)
+    df <- foldChangeData()
+    
+    df_wide <- df %>%
+      filter(Target %in% input$selectedTargets) %>%
+      group_by(Sample, Target, Type) %>%
+      summarise(fold_change = mean(fold_change, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Target, values_from = fold_change)
+    
+    if (nrow(df_wide) > 0 && length(unique(df_wide$Type)) == 2) {
+      df_wide$outcome <- ifelse(df_wide$Type == "Tumor", 1, 0)
+      
+      clean_miRNA_names <- make.names(names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")])
+      names(df_wide)[!names(df_wide) %in% c("Sample", "Type", "outcome")] <- clean_miRNA_names
+      
+      df_wide_complete <- df_wide[complete.cases(df_wide), ]
+      
+      if (nrow(df_wide_complete) < 10 || length(unique(df_wide_complete$outcome)) < 2) {
+        cat("====================================\n")
+        cat("MODEL SUMMARY\n")
+        cat("====================================\n\n")
+        cat("Status: Insufficient data for model training\n\n")
+        cat("Requirements:\n")
+        cat("  - At least 10 complete samples\n")
+        cat("  - Both Normal and Tumor samples present\n\n")
+        cat("Current data:\n")
+        cat("  - Total samples:", nrow(df_wide_complete), "\n")
+        cat("  - Unique sample types:", length(unique(df_wide_complete$outcome)), "\n")
+        return()
+      }
+      
+      X <- as.matrix(df_wide_complete[, clean_miRNA_names])
+      y <- df_wide_complete$outcome
+      
+      # Fit logistic regression without cross-validation
+      fit <- glmnet(X, y, family = "binomial", alpha = 0.5)
+      
+      # Use a reasonable lambda (not too small to avoid overfitting)
+      lambda_choice <- fit$lambda[length(fit$lambda) %/% 2]
+      
+      cat("====================================\n")
+      cat("REGULARIZED LOGISTIC REGRESSION\n")
+      cat("====================================\n\n")
+      
+      cat("Model Configuration:\n")
+      cat("-----------------------------------\n")
+      cat("  Regularization: Elastic Net (alpha = 0.5)\n")
+      cat("  Lambda:", sprintf("%.6f", lambda_choice), "\n\n")
+      
+      cat("Dataset Summary:\n")
+      cat("-----------------------------------\n")
+      cat("  Total samples:", nrow(df_wide_complete), "\n")
+      cat("  Normal samples:", sum(df_wide_complete$outcome == 0), "\n")
+      cat("  Tumor samples:", sum(df_wide_complete$outcome == 1), "\n")
+      cat("  Number of miRNAs:", length(clean_miRNA_names), "\n\n")
+      
+      cat("Selected miRNAs:\n")
+      cat("-----------------------------------\n")
+      for (i in seq_along(input$selectedTargets)) {
+        cat("  ", i, ". ", input$selectedTargets[i], "\n", sep = "")
+      }
+      cat("\n")
+      
+      coefs <- coef(fit, s = lambda_choice)
+      non_zero_coefs <- coefs[coefs[,1] != 0, , drop = FALSE]
+      
+      if (nrow(non_zero_coefs) > 1) {
+        cat("Non-zero Coefficients:\n")
+        cat("-----------------------------------\n")
+        for (i in seq_len(nrow(non_zero_coefs))) {
+          coef_name <- rownames(non_zero_coefs)[i]
+          coef_value <- non_zero_coefs[i, 1]
+          if (coef_name != "(Intercept)") {
+            cat("  ", coef_name, ": ", sprintf("%.4f", coef_value), "\n", sep = "")
+          }
+        }
+        cat("\n  (Intercept):", sprintf("%.4f", non_zero_coefs["(Intercept)", 1]), "\n")
+      } else {
+        cat("Note: All coefficients were regularized to zero\n")
+        cat("      Consider reducing the number of miRNAs\n")
+        cat("      or increasing sample size\n")
+      }
+      
+      cat("\n====================================\n")
+      
+    } else {
+      cat("====================================\n")
+      cat("MODEL SUMMARY\n")
+      cat("====================================\n\n")
+      cat("Status: Cannot generate model\n")
+      cat("Reason: Insufficient data or missing sample types\n")
+    }
+  })
+  
+  output$referenceGenesPlot <- renderPlot({
+    req(rawData())
+    df <- rawData()
+    
+    # Filter for reference genes (U6 and UniSP6) - case insensitive
+    ref_genes <- df %>% 
+      filter(tolower(Target) %in% c("u6", "unisp6")) %>%
+      filter(!is.na(Cq.Mean))
+    
+    if (nrow(ref_genes) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", xlim = c(0,1), ylim = c(0,1),
+           main = "No Reference Gene Data Available")
+      text(0.5, 0.5, "Reference genes (U6 or UniSP6) not found in dataset", 
+           cex = 1.3, col = "#666")
+      return()
+    }
+    
+    # Standardize the Target names for consistency
+    ref_genes <- ref_genes %>%
+      mutate(Target = case_when(
+        tolower(Target) == "u6" ~ "U6",
+        tolower(Target) == "unisp6" ~ "UniSP6",
+        TRUE ~ Target
+      ))
+    
+    # Create the bar plot
+    ggplot(ref_genes, aes(x = Sample, y = Cq.Mean, fill = Target)) +
+      geom_bar(stat = "identity", position = position_dodge(width = 0.8), 
+               width = 0.7, alpha = 0.9) +
+      geom_text(aes(label = sprintf("%.1f", Cq.Mean)), 
+                position = position_dodge(width = 0.8),
+                vjust = -0.5, size = 3, fontface = "bold") +
+      facet_wrap(~Type, scales = "free_x", ncol = 2) +
+      scale_fill_manual(values = c("U6" = "#2196F3", "UniSP6" = "#FF9800")) +
+      labs(
+        title = "Reference Gene Stability Check",
+        subtitle = "Lower variation indicates better normalization quality",
+        y = "Ct Value",
+        x = "Sample",
+        fill = "Reference Gene"
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 18, color = "#495057"),
+        plot.subtitle = element_text(hjust = 0.5, size = 12, color = "#666"),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 11),
+        axis.title = element_text(face = "bold", size = 13),
+        legend.position = "top",
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(size = 12),
+        strip.text = element_text(size = 13, face = "bold", color = "#495057"),
+        strip.background = element_rect(fill = "#f8f9fa", color = NA),
+        panel.border = element_rect(color = "#e1e4e8", fill = NA, size = 1),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()
+      ) +
+      ylim(0, max(ref_genes$Cq.Mean, na.rm = TRUE) * 1.15)
+  })
+}
+
+shinyApp(ui = ui, server = server)
