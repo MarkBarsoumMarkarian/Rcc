@@ -1,4 +1,23 @@
-# Epic miRNA qPCR Analysis with Fold Change & ROC
+# Epic miRNA qPCR Analysis with Fold Change, M-values & ROC
+
+# Function to install missing packages
+install_if_missing <- function(packages) {
+  for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+      message(paste("Installing package:", pkg))
+      install.packages(pkg, dependencies = TRUE)
+      library(pkg, character.only = TRUE)
+    }
+  }
+}
+
+# List of required packages
+required_packages <- c("shiny", "readxl", "dplyr", "ggplot2", "stringr", 
+                       "pROC", "tidyr", "glmnet", "shinythemes", "DT")
+
+# Install and load packages
+install_if_missing(required_packages)
+
 library(shiny)
 library(readxl)
 library(dplyr)
@@ -96,11 +115,11 @@ ui <- fluidPage(
       
       .main-panel-content {
         background: rgba(255, 255, 255, 0.98);
-        padding: 30px;
+        padding: 40px;
         border-radius: 20px;
         box-shadow: 0 10px 30px rgba(0,0,0,0.15);
         border: 2px solid rgba(255,255,255,0.3);
-        min-height: 600px;
+        min-height: 800px;
       }
       
       .file-upload-zone {
@@ -379,7 +398,7 @@ ui <- fluidPage(
   div(class = "main-header",
       h1(icon("dna"), "miRNA qPCR Analysis Platform"),
       div(class = "subtitle", 
-          "Fold Change Analysis • ROC Curves • Predictive Modeling")
+          "Fold Change Analysis • M-values • ROC Curves • Predictive Modeling")
   ),
   
   sidebarLayout(
@@ -429,7 +448,17 @@ ui <- fluidPage(
               )
             ),
             
-
+            tabPanel(
+              title = tagList(icon("ruler-combined"), "M-values"),
+              value = "mvalues",
+              div(class = "plot-container",
+                  div(class = "plot-title", icon("calculator"), " Reference Gene Stability Analysis (geNorm M-value)"),
+                  p(style = "color: #666; margin-bottom: 20px;",
+                    icon("info-circle"), 
+                    " M-value measures expression stability across ALL samples using the geNorm algorithm. Lower M-values indicate more stable reference genes. M < 0.5 is ideal, M < 1.0 is acceptable."),
+                  DT::dataTableOutput("mValueTable")
+              )
+            ),
             
             tabPanel(
               title = tagList(icon("table"), "Summary Statistics"),
@@ -464,7 +493,7 @@ ui <- fluidPage(
                   p(style = "color: #666; margin-bottom: 20px;",
                     icon("info-circle"), 
                     " Monitor the stability of your normalizers (U6/UniSP6). Consistent Ct values across samples indicate reliable normalization."),
-                  plotOutput("referenceGenesPlot", height = "500px")
+                  plotOutput("referenceGenesPlot", height = "600px")
               )
             )
           )
@@ -515,7 +544,8 @@ server <- function(input, output, session) {
     fold_change_df <- delta_cq %>%
       left_join(normal_avg, by="Target") %>%
       mutate(delta_delta_Cq = delta_Cq - avg_normal_delta_Cq,
-             fold_change = 2^(-delta_delta_Cq))
+             fold_change = 2^(-delta_delta_Cq),
+             m_value = log2(fold_change))
     
     return(fold_change_df)
   })
@@ -525,6 +555,8 @@ server <- function(input, output, session) {
       group_by(Target, Type) %>%
       summarise(mean_fold_change = mean(fold_change, na.rm=TRUE),
                 sd_fold_change = sd(fold_change, na.rm=TRUE),
+                mean_m_value = mean(m_value, na.rm=TRUE),
+                sd_m_value = sd(m_value, na.rm=TRUE),
                 n = n(),
                 .groups="drop")
   })
@@ -561,18 +593,51 @@ server <- function(input, output, session) {
     req(input$selectedTargets)
     df_subset <- df %>% filter(Target %in% input$selectedTargets)
     
+    # Calculate p-values for each target
+    p_values <- df_subset %>%
+      group_by(Target) %>%
+      summarise(
+        p_value = tryCatch({
+          if(length(unique(Type)) == 2) {
+            normal_vals <- fold_change[Type == "Normal"]
+            tumor_vals <- fold_change[Type == "Tumor"]
+            if(length(normal_vals) >= 2 && length(tumor_vals) >= 2) {
+              wilcox.test(normal_vals, tumor_vals)$p.value
+            } else {
+              NA
+            }
+          } else {
+            NA
+          }
+        }, error = function(e) NA),
+        max_y = max(fold_change, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        significance = case_when(
+          is.na(p_value) ~ "",
+          p_value < 0.001 ~ "*",
+          p_value < 0.01 ~ "",
+          p_value < 0.05 ~ "*",
+          TRUE ~ "ns"
+        ),
+        y_position = max_y * 1.3
+      )
+    
     ggplot(df_subset, aes(x = Type, y = fold_change, color = Type, fill = Type)) +
       geom_boxplot(alpha = 0.3, outlier.shape = NA) +
       geom_jitter(position = position_jitterdodge(jitter.width=0.15, dodge.width=0.75),
                   size=3, alpha=0.7) +
       stat_summary(fun=mean, geom="point", shape=18, size=5, color="black",
                    position=position_dodge(width=0.75)) +
+      geom_text(data = p_values, aes(x = 1.5, y = y_position, label = significance),
+                inherit.aes = FALSE, size = 6, fontface = "bold", color = "#495057") +
       scale_color_manual(values=c("Normal"="#4CAF50","Tumor"="#f44336")) +
       scale_fill_manual(values=c("Normal"="#4CAF50","Tumor"="#f44336")) +
       scale_y_log10(labels = scales::comma) +
       geom_hline(yintercept = 1, linetype="dashed", color="gray40", size=0.8) +
       labs(y="Fold Change (log scale)", x="", title = NULL) +
-      facet_wrap(~Target, scales="free_x", ncol=3) +
+      facet_wrap(~Target, scales="free", ncol=3) +
       theme_minimal(base_size = 13) +
       theme(
         legend.position="none",
@@ -585,8 +650,164 @@ server <- function(input, output, session) {
         panel.border = element_rect(color="#e1e4e8", fill=NA, size=1)
       )
   }, height = function() {
+    req(input$selectedTargets)
     n_plots <- length(input$selectedTargets)
+    if(n_plots == 0) return(400)
     400 + 150 * ceiling(n_plots / 3)
+  })
+  
+  output$mValueTable <- DT::renderDataTable({
+    df <- rawData()
+    
+    # Filter for potential reference genes
+    all_genes <- df %>% 
+      filter(!is.na(Cq.Mean)) %>%
+      filter(Type %in% c("Normal", "Tumor"))
+    
+    if (nrow(all_genes) == 0) {
+      return(data.frame(Message = "No gene data available"))
+    }
+    
+    # Identify reference genes and other genes
+    ref_gene_names <- c("u6", "unisp6", "rnu6b", "snord44", "snord48")
+    
+    all_genes <- all_genes %>%
+      mutate(
+        Target_lower = tolower(Target),
+        is_ref_gene = Target_lower %in% ref_gene_names,
+        Target_std = case_when(
+          Target_lower == "u6" ~ "U6",
+          Target_lower == "unisp6" ~ "UniSP6",
+          Target_lower == "rnu6b" ~ "RNU6B",
+          Target_lower == "snord44" ~ "SNORD44",
+          Target_lower == "snord48" ~ "SNORD48",
+          TRUE ~ Target
+        )
+      )
+    
+    # Get existing reference genes
+    existing_ref_genes <- all_genes %>%
+      filter(is_ref_gene) %>%
+      pull(Target_std) %>%
+      unique()
+    
+    # If we have fewer than 3 reference genes, find the best candidate
+    selected_genes <- existing_ref_genes
+    
+    if (length(selected_genes) < 3) {
+      other_genes_stability <- all_genes %>%
+        filter(!is_ref_gene) %>%
+        group_by(Target_std) %>%
+        summarise(
+          mean_Cq = mean(Cq.Mean, na.rm = TRUE),
+          sd_Cq = sd(Cq.Mean, na.rm = TRUE),
+          cv = (sd(Cq.Mean, na.rm = TRUE) / mean(Cq.Mean, na.rm = TRUE)) * 100,
+          n = n(),
+          .groups = "drop"
+        ) %>%
+        filter(n >= 5, !is.na(cv), !is.infinite(cv)) %>%
+        arrange(cv)
+      
+      genes_needed <- 3 - length(selected_genes)
+      if (nrow(other_genes_stability) > 0 && genes_needed > 0) {
+        additional_genes <- head(other_genes_stability$Target_std, genes_needed)
+        selected_genes <- c(selected_genes, additional_genes)
+      }
+    } else {
+      selected_genes <- head(selected_genes, 3)
+    }
+    
+    if (length(selected_genes) < 2) {
+      return(data.frame(Message = "Insufficient genes for M-value calculation"))
+    }
+    
+    # Filter data for selected genes
+    selected_data <- all_genes %>%
+      filter(Target_std %in% selected_genes) %>%
+      select(Sample, Target_std, Cq.Mean) %>%
+      pivot_wider(names_from = Target_std, values_from = Cq.Mean, values_fn = mean)
+    
+    selected_data <- selected_data[complete.cases(selected_data), ]
+    
+    if (nrow(selected_data) < 3) {
+      return(data.frame(Message = "Insufficient complete data for M-value calculation"))
+    }
+    
+    # Calculate geNorm M-values
+    gene_cols <- selected_genes
+    m_values_result <- data.frame(Gene = character(), M_value = numeric(), stringsAsFactors = FALSE)
+    
+    for (gene in gene_cols) {
+      pairwise_sd <- c()
+      for (other_gene in gene_cols) {
+        if (gene != other_gene) {
+          log_ratios <- log2(selected_data[[gene]] / selected_data[[other_gene]])
+          pairwise_sd <- c(pairwise_sd, sd(log_ratios, na.rm = TRUE))
+        }
+      }
+      m_val <- mean(pairwise_sd, na.rm = TRUE)
+      m_values_result <- rbind(m_values_result, data.frame(Gene = gene, M_value = m_val))
+    }
+    
+    # Add additional statistics
+    summary_df <- all_genes %>%
+      filter(Target_std %in% selected_genes) %>%
+      group_by(Target_std) %>%
+      summarise(
+        Mean_Cq = round(mean(Cq.Mean, na.rm = TRUE), 2),
+        SD_Cq = round(sd(Cq.Mean, na.rm = TRUE), 3),
+        CV_percent = round((sd(Cq.Mean, na.rm = TRUE) / mean(Cq.Mean, na.rm = TRUE)) * 100, 2),
+        N_samples = n(),
+        .groups = "drop"
+      ) %>%
+      left_join(m_values_result, by = c("Target_std" = "Gene")) %>%
+      mutate(
+        M_value = round(M_value, 3),
+        Stability = case_when(
+          M_value < 0.5 ~ "Excellent",
+          M_value < 1.0 ~ "Good",
+          M_value < 1.5 ~ "Acceptable",
+          TRUE ~ "Poor"
+        ),
+        Gene_Type = ifelse(Target_std %in% existing_ref_genes, "Reference", "Candidate")
+      ) %>%
+      arrange(M_value) %>%
+      rename(
+        "Gene" = Target_std,
+        "Mean Ct" = Mean_Cq,
+        "SD" = SD_Cq,
+        "M-value" = M_value,
+        "CV (%)" = CV_percent,
+        "Samples" = N_samples,
+        "Type" = Gene_Type,
+        "Stability" = Stability
+      )
+    
+    DT::datatable(summary_df,
+                  options = list(
+                    pageLength = 25,
+                    searching = TRUE,
+                    ordering = TRUE
+                  ),
+                  rownames = FALSE,
+                  class = 'cell-border stripe hover') %>%
+      DT::formatStyle(
+        'Stability',
+        backgroundColor = DT::styleEqual(
+          c('Excellent', 'Good', 'Acceptable', 'Poor'),
+          c('#4CAF50', '#8BC34A', '#FF9800', '#f44336')
+        ),
+        color = 'white',
+        fontWeight = 'bold'
+      ) %>%
+      DT::formatStyle(
+        'Type',
+        backgroundColor = DT::styleEqual(
+          c('Reference', 'Candidate'),
+          c('#E3F2FD', '#FFF9C4')
+        ),
+        fontWeight = 'bold'
+      )
   })
   
   output$summaryTable <- DT::renderDataTable({
@@ -596,6 +817,7 @@ server <- function(input, output, session) {
         mean_fold_change = round(mean_fold_change, 3),
         sd_fold_change = round(sd_fold_change, 3)
       ) %>%
+      select(Target, Type, mean_fold_change, sd_fold_change, n) %>%
       rename(
         "miRNA" = Target,
         "Type" = Type,
@@ -639,7 +861,9 @@ server <- function(input, output, session) {
       abline(a=0, b=1, lty=2, col="gray50")
     }
   }, height = function() {
+    req(input$selectedTargets)
     n_plots <- length(input$selectedTargets)
+    if(n_plots == 0) return(400)
     300 + 200 * ceiling(n_plots / 3)
   })
   
@@ -830,14 +1054,10 @@ server <- function(input, output, session) {
         TRUE ~ Target
       ))
     
-    # Create the bar plot
+    # Create separate plots for each reference gene and sample type combination
     ggplot(ref_genes, aes(x = Sample, y = Cq.Mean, fill = Target)) +
-      geom_bar(stat = "identity", position = position_dodge(width = 0.8), 
-               width = 0.7, alpha = 0.9) +
-      geom_text(aes(label = sprintf("%.1f", Cq.Mean)), 
-                position = position_dodge(width = 0.8),
-                vjust = -0.5, size = 3, fontface = "bold") +
-      facet_wrap(~Type, scales = "free_x", ncol = 2) +
+      geom_bar(stat = "identity", width = 0.7, alpha = 0.9) +
+      facet_grid(Target ~ Type, scales = "free_x", space = "free_x") +
       scale_fill_manual(values = c("U6" = "#2196F3", "UniSP6" = "#FF9800")) +
       labs(
         title = "Reference Gene Stability Check",
@@ -856,14 +1076,15 @@ server <- function(input, output, session) {
         legend.position = "top",
         legend.title = element_text(face = "bold"),
         legend.text = element_text(size = 12),
-        strip.text = element_text(size = 13, face = "bold", color = "#495057"),
+        strip.text = element_text(size = 12, face = "bold", color = "#495057"),
         strip.background = element_rect(fill = "#f8f9fa", color = NA),
         panel.border = element_rect(color = "#e1e4e8", fill = NA, size = 1),
         panel.grid.minor = element_blank(),
-        panel.grid.major.x = element_blank()
+        panel.grid.major.x = element_blank(),
+        panel.spacing = unit(1, "lines")
       ) +
       ylim(0, max(ref_genes$Cq.Mean, na.rm = TRUE) * 1.15)
   })
 }
 
-shinyApp(ui = ui, server = server)
+shinyApp(ui = ui, server = server)
