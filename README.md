@@ -69,20 +69,6 @@ Fold Change (FC) = 2^(-ΔΔCt)
 - FC = 2: 2-fold increase (100% increase)
 - FC = 0.5: 2-fold decrease (50% of normal expression)
 
-#### 1.4 M-value Calculation
-M-values represent log2 fold changes, providing symmetric distribution around zero:
-
-```
-M-value = log2(Fold Change) = -ΔΔCt × log2(e)
-```
-
-**Interpretation:**
-- M = 0: No change
-- M > 0: Upregulation
-- M < 0: Downregulation
-- M = 1: 2-fold increase
-- M = -1: 2-fold decrease
-
 ### 2. Reference Gene Stability Analysis (geNorm Algorithm)
 
 The platform implements the geNorm algorithm (Vandesompele et al., 2002) to assess reference gene expression stability across all samples.
